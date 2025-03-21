@@ -304,7 +304,7 @@ df = pd.read_csv('track_1.csv')
 df['test_id'] = df['test_id'].str.replace('test_', '', regex=False)
 
 # Save the modified DataFrame back to the CSV file
-df.to_csv('track_2.csv', index=False)
+df.to_csv('track_1.csv', index=False)
 # Upload the CSV file to Kaggle
 api.competition_submit(competition=kaggle_competition, file_name=predictions_csv_path, message=kaggle_message)
 
