@@ -2,15 +2,11 @@
 
 import subprocess
 import os
-import glob
-import numpy as np
-import rasterio as rio
-from rasterio.plot import reshape_as_image
 import matplotlib.pyplot as plt
 
 def install_packages():
     try:
-        subprocess.check_call(['pip', 'install', 'rasterio', 'matplotlib', 'kaggle'])
+        subprocess.check_call(['pip', 'install', 'kaggle'])
         print("Packages installed successfully.")
     except subprocess.CalledProcessError as e:
         print(f"Error installing packages: {e}")
@@ -24,9 +20,6 @@ install_packages()
 plt.switch_backend('Agg')
 
 print("### Dataset Download")
-print('<img align="center" style="max-width: 300px; height: auto" src="https://github.com/HSG-AIML-Teaching/ML2025-Lab/blob/main/cc_1/eurosat.png?raw=1">')
-print("The Eurosat dataset is available on [github](https://github.com/phelber/EuroSAT).")
-print("The multi-spectral (MS) version can be downloaded with the following command:")
 
 # --- Download EuroSATallBands.zip (with check) ---
 eurosat_zip_file = "EuroSATallBands.zip"
