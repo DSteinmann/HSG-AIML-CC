@@ -6,20 +6,23 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import numpy as np
 import pandas as pd
+from torchgeo.models import resnet152, ResNet152_Weights
 from torchvision.models import resnext101_32x8d, convnext_large, ConvNeXt_Large_Weights, convnext_base, \
-    ConvNeXt_Base_Weights
+    ConvNeXt_Base_Weights, resnet101, ResNet101_Weights
 
 
 class ResNet50Sentinel2(nn.Module):
-    def __init__(self, num_classes, pretrained=False):  # Pretrained should be False for loading
+    # ... (same as before)
+    def __init__(self, num_classes, pretrained=True):
         super().__init__()
-        self.resnet50 = resnext101_32x8d(weights=None) # Load without pretrained weights initially
+        self.resnet50 = resnet152(weights=ResNet152_Weights.SENTINEL2_SI_MS_SATLAS if pretrained else None)
         original_conv1 = self.resnet50.conv1
         self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
                                        kernel_size=original_conv1.kernel_size,
                                        stride=original_conv1.stride,
                                        padding=original_conv1.padding,
                                        bias=False if original_conv1.bias is None else True)
+
         num_ftrs = self.resnet50.fc.in_features
         self.resnet50.fc = nn.Linear(num_ftrs, num_classes)
 
@@ -103,9 +106,10 @@ class TestDatasetNPY(Dataset):
 
         return image_tensor, test_id
 
+
 def main():
     # --- Configuration ---
-    model_path = "resnet50_sentinel2_trained.pth"  # Path to your trained model file
+    model_path = "convnext_sentinel2_trained_best.pth"  # Path to your trained model file
     test_data_dir = "./testset/testset"  # Path to the directory containing .npy test files
     output_csv_path = "_track2.csv"
     num_classes = 10  # Replace with the number of classes your model was trained on
@@ -130,7 +134,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False) # No need to shuffle for evaluation
 
     # --- Load the Model ---
-    model = ConvNeXtSentinel2(num_classes=num_classes)
+    model = ResNet50Sentinel2(num_classes=num_classes)
     model.load_state_dict(torch.load(model_path))
     model.eval() # Set the model to evaluation mode
 
@@ -168,9 +172,11 @@ def main():
 
     print(f"Predictions saved to {output_csv_path}")
 
+
+
 if __name__ == "__main__":
 
-    npy_file_path = "/Users/dom/projects/HSG-AIML-CC/testset/testset/test_1.npy"  # Replace with the actual path
+    npy_file_path = "./testset/testset/test_1.npy"  # Replace with the actual path
     data = np.load(npy_file_path)
     print(f"Shape of {npy_file_path}: {data.shape}")
     test_data_dir = "./testset/testset"

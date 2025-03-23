@@ -2,6 +2,8 @@
 
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import _LRScheduler
+from torchgeo.models import ResNet152_Weights, resnet152
 from torchvision.models import convnext_base, ConvNeXt_Large_Weights, resnet101, ResNet101_Weights, \
     ConvNeXt_Base_Weights
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -57,7 +59,7 @@ class ResNet50Sentinel2(nn.Module):
     # ... (same as before)
     def __init__(self, num_classes, pretrained=True):
         super().__init__()
-        self.resnet50 = resnet101(weights=ResNet101_Weights.IMAGENET1K_V2 if pretrained else None)
+        self.resnet50 = resnet152(weights=ResNet152_Weights.SENTINEL2_SI_MS_SATLAS if pretrained else None)
         original_conv1 = self.resnet50.conv1
         self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
                                        kernel_size=original_conv1.kernel_size,
@@ -146,6 +148,54 @@ class Sentinel2Folder(Dataset):
             print(e)
             return None, label
 
+def check_frozen_layers(model):
+    frozen_count = 0
+    total_count = 0
+    for name, param in model.named_parameters():
+        total_count += 1
+        if not param.requires_grad:
+            print(f"Layer '{name}' is frozen (requires_grad=False)")
+            frozen_count += 1
+    if frozen_count == 0:
+        print("All layers in the model are trainable (requires_grad=True)")
+    else:
+        print(f"Found {frozen_count} frozen layers out of {total_count} total layers.")
+
+def unfreeze_all_layers(model):
+    for param in model.parameters():
+        param.requires_grad = True
+    print("All layers in the model have been unfrozen (requires_grad=True).")
+
+class WarmupLR(_LRScheduler):
+    """
+    Warmup learning rate scheduler.
+
+    Args:
+        optimizer (Optimizer): Wrapped optimizer.
+        warmup_steps (int): Number of warmup steps.
+        initial_lr (float): Initial learning rate at the start of warmup.
+        target_lr (float): Target learning rate after warmup.
+        last_epoch (int): The index of the last epoch when resuming a training.
+            Default: -1.
+        verbose (bool): If ``True``, prints a message to stdout for
+            each update. Default: ``False``.
+    """
+
+    def __init__(self, optimizer, warmup_steps, initial_lr, target_lr, last_epoch=-1, verbose=False):
+        self.warmup_steps = warmup_steps
+        self.initial_lr = initial_lr
+        self.target_lr = target_lr
+        super().__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            # Linear warmup
+            alpha = self.last_epoch / float(self.warmup_steps)
+            return [self.initial_lr + (self.target_lr - self.initial_lr) * alpha for base_lr in self.base_lrs]
+        else:
+            # After warmup, keep the target learning rate
+            return self.base_lrs
+
 if __name__ == '__main__':
     # --- Configuration ---
     seed = 1337
@@ -157,10 +207,13 @@ if __name__ == '__main__':
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     root_directory = "./ds/images/remote_sensing/otherDatasets/sentinel_2/tif"  # Replace with your actual data path
-    batch_size = 8  # Experiment with this
-    image_size = 64
+    batch_size = 16  # Experiment with this
+    image_size = 1024
     learning_rate = 0.0001
+    weight_decay = 0.005
     num_epochs = 100
+    warmup_epochs = 5  # Number of warmup epochs
+    initial_warmup_lr = 1e-6  # Very small initial learning rate
     num_workers = 8  # Adjust this based on your CPU cores
     train_ratio = 0.8
     val_ratio = 0.1
@@ -188,36 +241,62 @@ if __name__ == '__main__':
     print(f"Training set size: {len(train_dataset)}")
     print(f"Validation set size: {len(val_dataset)}")
     print(f"Test set size: {len(test_dataset)}")
+    # --- Create DataLoaders ---
 
     # --- Define Data Transforms ---
     train_transforms = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(degrees=20),
-        transforms.ToTensor(),  # Make sure this is included
+        transforms.RandomRotation(degrees=30),
+        transforms.ToTensor(),
+        #transforms.Normalize(mean=train_mean, std=train_std),
         # Add more transformations as needed
     ])
 
     val_transforms = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
+        # transforms.Normalize(mean=train_mean, std=train_std),
     ])
 
     test_transforms = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
+        # transforms.Normalize(mean=train_mean, std=train_std),
     ])
-
-    # --- Create Dataset ---
-    full_dataset = Sentinel2Folder(root_directory, transform=train_transforms)  # Apply train transforms
-    # ... (splitting dataset)
 
     train_dataset.transform = train_transforms
     val_dataset.transform = val_transforms
     test_dataset.transform = test_transforms
 
-    # --- Create DataLoaders ---
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,  generator=torch.Generator().manual_seed(seed))
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                              generator=torch.Generator().manual_seed(seed))
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    print("Calculating mean and standard deviation of the training dataset...")
+    num_bands = 12
+    total_sum = torch.zeros(num_bands)
+    total_squared_sum = torch.zeros(num_bands)
+    total_pixels = 0
+    for batch_idx, (data, targets) in enumerate(train_loader):
+        if data is not None:
+            # Data shape: [batch_size, num_channels, height, width]
+            # We have only one batch here since batch_size = len(train_dataset)
+            data = data.float()  # Ensure data is float for calculations
+            total_sum += torch.sum(data, dim=(0, 2, 3))  # Sum over batch, height, and width
+            total_squared_sum += torch.sum(data ** 2, dim=(0, 2, 3))
+            total_pixels += data.numel() // num_bands
+
+    train_mean = total_sum / total_pixels
+    train_std = torch.sqrt((total_squared_sum / total_pixels) - (train_mean ** 2))
+
+
+
+    # --- Create Dataset ---
+    # ... (splitting dataset)
+
 
     # --- Determine Device ---
     if torch.backends.mps.is_available():
@@ -229,20 +308,26 @@ if __name__ == '__main__':
     print(f"Using device: {device}")
 
     # --- Create Model and Move to Device ---
-    model = ConvNeXtSentinel2(num_classes=num_classes, pretrained=True).to(device)
+    model = ResNet50Sentinel2(num_classes=num_classes, pretrained=True).to(device)
+
+    unfreeze_all_layers(model)
+    check_frozen_layers(model) # Verify that all are unfrozen
 
     # --- Define Loss Function and Optimizer ---
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.0001)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3, verbose=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    warmup_steps_per_epoch = len(train_loader)  # Number of steps in one epoch
+    total_warmup_steps = warmup_steps_per_epoch * warmup_epochs
 
-    # --- Early Stopping Implementation ---
+    warmup_scheduler = WarmupLR(optimizer, total_warmup_steps, initial_warmup_lr, learning_rate)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience, verbose=True)
+
+    # --- Training Loop with Validation and Early Stopping ---
     best_val_loss = float('inf')
     epochs_without_improvement = 0
     best_model_state = None
 
-    # --- Training Loop with Validation ---
-    # --- Training Loop with Validation and Early Stopping ---
     for epoch in range(num_epochs):
         # Training
         model.train()
@@ -261,6 +346,7 @@ if __name__ == '__main__':
             loss.backward()
             optimizer.step()
 
+            warmup_scheduler.step()
             total_train_loss += loss.item() * data.size(0)
             _, predicted = torch.max(outputs.data, 1)
             total_train_samples += targets.size(0)
@@ -296,9 +382,12 @@ if __name__ == '__main__':
 
         avg_val_loss = total_val_loss / total_val_samples if total_val_samples > 0 else 0
         val_accuracy = correct_val_predictions / total_val_samples if total_val_samples > 0 else 0
-        scheduler.step(avg_val_loss)
         print(
             f'Epoch [{epoch + 1}/{num_epochs}], Average Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}')
+
+        # Learning Rate Scheduler Step
+        if epoch >= warmup_epochs:
+            scheduler.step(avg_val_loss)
 
         # Early Stopping Check
         if avg_val_loss < best_val_loss:
@@ -343,5 +432,5 @@ if __name__ == '__main__':
     test_accuracy = correct_test_predictions / total_test_samples if total_test_samples > 0 else 0
     print(f'Average Test Loss: {avg_test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}')
 
-    # --- Optional: Save the trained model ---
-    torch.save(model.state_dict(), "resnet50_sentinel2_trained.pth")
+    # --- Optional: Save the trained model (best state) ---
+    torch.save(model.state_dict(), "convnext_sentinel2_trained_best.pth")

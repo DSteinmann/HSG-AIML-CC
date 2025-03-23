@@ -7,9 +7,8 @@ import pandas as pd
 import numpy as np
 import os
 import rasterio
-import rasterio
-from kaggle.api.kaggle_api_extended import KaggleApi
 from collections import Counter
+from sklearn.model_selection import train_test_split
 
 
 # --- Setup ---
@@ -17,7 +16,7 @@ USE_CUDA = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if USE_CUDA else "cpu")
 print(f"Using device: {DEVICE}")
 
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 NUM_EPOCHS = 50
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 0.001
@@ -26,6 +25,13 @@ train_dir = './ds/images/remote_sensing/otherDatasets/sentinel_2/tif'
 validation_dir = './testset/testset'
 model_save_path = 'standalone_resnet.pth'
 predictions_csv_path = 'track_1.csv'
+
+
+
+def normalize_image(image):
+    # Common normalization logic here
+    return (image - np.mean(image, axis=(1, 2), keepdims=True)) / (
+                np.std(image, axis=(1, 2), keepdims=True) + 1e-7)
 
 
 class NpyDataset(Dataset):
@@ -55,9 +61,7 @@ class NpyDataset(Dataset):
         data = torch.from_numpy(data).float()
 
         # Normalize data if necessary
-        data = (data - torch.mean(data, dim=(1, 2), keepdims=True)) / (
-                torch.std(data, dim=(1, 2), keepdims=True) + 1e-7)
-
+        data = normalize_image(data)
         label = torch.tensor(self.labels[idx], dtype=torch.long)
 
         if self.transform:
@@ -66,19 +70,15 @@ class NpyDataset(Dataset):
         return data, label, os.path.basename(file_path)
 # --- Custom Dataset ---
 class Sentinel2Dataset(Dataset):
-    def __init__(self, root_dir, transform=None, file_type='.tif'):
-        self.root_dir = root_dir
+    def __init__(self, file_paths, transform=None):
+        self.file_paths = [fp for fp in file_paths if os.path.exists(fp)]
         self.transform = transform
-        self.file_type = file_type
-        self.file_paths = []
         self.labels = []
 
-        for subdir, _, files in os.walk(root_dir):
-            for file in files:
-                if file.endswith(self.file_type):
-                    self.file_paths.append(os.path.join(subdir, file))
-                    class_name = os.path.basename(subdir)
-                    self.labels.append(class_name)
+        # Assign labels based on file paths or other logic
+        for file_path in self.file_paths:
+            # Example logic to assign labels
+            self.labels.append(0)  # Replace with actual label logic
 
         self.classes = sorted(list(set(self.labels)))
         self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
@@ -88,8 +88,11 @@ class Sentinel2Dataset(Dataset):
         return len(self.file_paths)
 
     def __getitem__(self, idx):
-        image_path = self.file_paths[idx]
-        image = rasterio.open(image_path).read()
+        file_path = self.file_paths[idx]
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        # Load image from file_path
+        image = rasterio.open(file_path).read()
 
         # Remove the 10th band (index 9 in zero-based indexing)
         image = np.delete(image, 9, axis=0)
@@ -100,13 +103,14 @@ class Sentinel2Dataset(Dataset):
 
         image = torch.from_numpy(image).float()
         label = torch.tensor(self.labels[idx], dtype=torch.long)
+
         if self.transform:
             image = self.transform(image)
-        return image, label, os.path.basename(image_path)
 
-
+        return image, label, os.path.basename(file_path)
 # --- Data Augmentation ---
 train_transforms = transforms.Compose([
+    transforms.Resize(1024),
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
     transforms.RandomRotation(degrees=30),
@@ -115,15 +119,30 @@ train_transforms = transforms.Compose([
 ])
 
 val_transforms = transforms.Compose([
-    transforms.Resize(64),
+    transforms.Resize(1024),
     transforms.Normalize([0.485] * 12, [0.229] * 12)
 ])
 # --- Create Datasets and DataLoaders ---
+
 train_dataset = Sentinel2Dataset(train_dir, transform=train_transforms)
 validation_dataset = NpyDataset(validation_dir)
+file_paths = train_dataset.file_paths
+labels = train_dataset.labels
+unique_labels = sorted(list(set(labels)))
+label_to_idx = {label: i for i, label in enumerate(unique_labels)}
+labels = [label_to_idx[label] for label in labels]
+
+# Now, file_paths and labels should have the same length
+assert len(file_paths) == len(labels), "File paths and labels must have the same length"
+train_paths, val_paths, train_labels, val_labels = train_test_split(file_paths, labels, test_size=0.2, random_state=42, stratify=labels)
+train_dataset = Sentinel2Dataset(train_paths, transform=train_transforms)
+validation_dataset_train = Sentinel2Dataset(val_paths, transform=val_transforms)
+
+
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-validation_loader = DataLoader(validation_dataset, batch_size=BATCH_SIZE, shuffle=False)
+validation_loader = DataLoader(validation_dataset_train, batch_size=BATCH_SIZE, shuffle=False)
+final_val_loader = DataLoader(validation_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
 # --- Define Standalone ResNet-like Model ---
@@ -132,11 +151,10 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
         self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=False)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-        # Ensure the residual connection has the correct number of channels
         if stride != 1 or in_channels != out_channels:
             self.downsample = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
@@ -148,8 +166,8 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = x if self.downsample is None else self.downsample(x)
         x = self.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        x += residual
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = x + residual
         return self.relu(x)
 
 
@@ -165,10 +183,12 @@ class StandaloneResNet(nn.Module):
         self.layer1 = ResidualBlock(64, 128)  # Downsampling here
         self.layer2 = ResidualBlock(128, 256)  # Downsampling here
         self.layer3 = ResidualBlock(256, 512)  # Downsampling here
+        self.layer4 = ResidualBlock(512, 1024)  # Downsampling here
+        self.layer5 = ResidualBlock(1024, 2048)  # Downsampling here
 
         # Final layers
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512, 256)
+        self.fc = nn.Linear(2048, 256)
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, num_classes)
 
@@ -177,16 +197,16 @@ class StandaloneResNet(nn.Module):
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
         x = self.avgpool(x)
-        x = torch.flatten(self.avgpool(x), 1)
+        x = torch.flatten(x, 1)
         x = self.relu(self.fc(x))
         x = self.relu(self.fc2(x))
         return self.fc3(x)
 
-
 model = StandaloneResNet(num_classes=len(train_dataset.classes))
 model.to(DEVICE)
-
 # --- Training Loop ---
 # Calculate class frequencies
 label_counts = Counter(train_dataset.labels)
@@ -211,7 +231,6 @@ for epoch in range(NUM_EPOCHS):
     correct = 0
     total = 0
     for inputs, labels, _ in train_loader:
-        #print(inputs.shape)
         inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
 
         optimizer.zero_grad()
@@ -252,7 +271,7 @@ for epoch in range(NUM_EPOCHS):
 
     print(f"Epoch {epoch + 1} Validation Loss: {val_loss:.4f}, Validation Acc: {val_accuracy * 100:.2f}%")
 
-    if val_loss < best_val_loss:
+    if val_loss < best_val_loss and epoch > 1:
         best_val_loss = val_loss
         torch.save(model.state_dict(), model_save_path)
         print(f"Model saved at epoch {epoch + 1} with validation loss: {val_loss:.4f}")
@@ -273,7 +292,7 @@ best_model.to(DEVICE)
 best_model.eval()  # Set to evaluation mode
 
 with torch.no_grad():
-    for inputs, _, image_paths in validation_loader:  # Get filenames!
+    for inputs, _, image_paths in final_val_loader:  # Get filenames!
         inputs = inputs.to(DEVICE)
         outputs = best_model(inputs)
         _, predicted = torch.max(outputs, 1)
