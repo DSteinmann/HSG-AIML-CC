@@ -6,22 +6,51 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import numpy as np
 import pandas as pd
-from torchgeo.models import resnet152, ResNet152_Weights
+from torchgeo.models import resnet50, ResNet152_Weights, ResNet50_Weights
 from torchvision.models import resnext101_32x8d, convnext_large, ConvNeXt_Large_Weights, convnext_base, \
     ConvNeXt_Base_Weights, resnet101, ResNet101_Weights
+from torchvision.transforms import transforms
 
 
 class ResNet50Sentinel2(nn.Module):
     # ... (same as before)
-    def __init__(self, num_classes, pretrained=True):
+    def __init__(self, num_classes, pretrained=False):
         super().__init__()
-        self.resnet50 = resnet152(weights=ResNet152_Weights.SENTINEL2_SI_MS_SATLAS if pretrained else None)
+        self.resnet50 = resnet50(weights=ResNet50_Weights.SENTINEL2_ALL_MOCO if pretrained else None)
         original_conv1 = self.resnet50.conv1
         self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
-                                       kernel_size=original_conv1.kernel_size,
-                                       stride=original_conv1.stride,
-                                       padding=original_conv1.padding,
-                                       bias=False if original_conv1.bias is None else True)
+                                        kernel_size=original_conv1.kernel_size,
+                                        stride=original_conv1.stride,
+                                        padding=original_conv1.padding,
+                                        bias=False if original_conv1.bias is None else True)
+        if pretrained:
+            original_weights = original_conv1.weight.data
+            # Remove the weights corresponding to the 10th channel (index 9)
+            indices_to_keep = [i for i in range(original_weights.shape[1]) if i != 9]
+            new_weights = original_weights[:, indices_to_keep, :, :]
+
+            # Create a new first convolutional layer with 12 input channels
+            self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
+                                            kernel_size=original_conv1.kernel_size,
+                                            stride=original_conv1.stride,
+                                            padding=original_conv1.padding,
+                                            bias=False if original_conv1.bias is None else True)
+
+            # Initialize the weights of the new first layer with the modified pre-trained weights
+            self.resnet50.conv1.weight.data = new_weights
+
+            # Freeze earlier layers (excluding the classifier)
+            for name, param in self.resnet50.named_parameters():
+                if name not in ['fc.weight', 'fc.bias']:
+                    param.requires_grad = False
+        else:
+            # If not pretrained, initialize the first conv layer for 12 channels
+            self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
+                                            kernel_size=original_conv1.kernel_size,
+                                            stride=original_conv1.stride,
+                                            padding=original_conv1.padding,
+                                            bias=False if original_conv1.bias is None else True)
+            nn.init.kaiming_normal_(self.resnet50.conv1.weight, mode='fan_out', nonlinearity='relu')
 
         num_ftrs = self.resnet50.fc.in_features
         self.resnet50.fc = nn.Linear(num_ftrs, num_classes)
@@ -30,7 +59,7 @@ class ResNet50Sentinel2(nn.Module):
         return self.resnet50(x)
 
 class ConvNeXtSentinel2(nn.Module):
-    def __init__(self, num_classes, pretrained=True):
+    def __init__(self, num_classes, pretrained=False):
         super().__init__()
         self.convnext = convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT if pretrained else None)
 
@@ -130,7 +159,12 @@ def main():
         # Adjust this based on your actual class names and mapping
 
     # --- Create Test Dataset ---
-    test_dataset = TestDatasetNPY(test_data_dir, label_map=label_map)
+    test_transforms = transforms.Compose([
+        transforms.Resize((256, 256))
+        # CALCULATE MEAN AND STD TOMORROW
+    ])
+
+    test_dataset = TestDatasetNPY(test_data_dir, label_map=label_map, transform=test_transforms)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False) # No need to shuffle for evaluation
 
     # --- Load the Model ---

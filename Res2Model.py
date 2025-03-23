@@ -1,9 +1,9 @@
 # runnable_resnet50_sentinel2_optimized_mac.py
-
+import optuna
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import _LRScheduler
-from torchgeo.models import ResNet152_Weights, resnet152
+from torchgeo.models import ResNet152_Weights, resnet152, resnet50, ResNet50_Weights
 from torchvision.models import convnext_base, ConvNeXt_Large_Weights, resnet101, ResNet101_Weights, \
     ConvNeXt_Base_Weights
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -59,7 +59,7 @@ class ResNet50Sentinel2(nn.Module):
     # ... (same as before)
     def __init__(self, num_classes, pretrained=True):
         super().__init__()
-        self.resnet50 = resnet152(weights=ResNet152_Weights.SENTINEL2_SI_MS_SATLAS if pretrained else None)
+        self.resnet50 = resnet50(weights=ResNet50_Weights.SENTINEL2_ALL_MOCO if pretrained else None)
         original_conv1 = self.resnet50.conv1
         self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
                                        kernel_size=original_conv1.kernel_size,
@@ -67,16 +67,34 @@ class ResNet50Sentinel2(nn.Module):
                                        padding=original_conv1.padding,
                                        bias=False if original_conv1.bias is None else True)
         if pretrained:
-            pretrained_weights = original_conv1.weight.data
-            new_weights = torch.cat([pretrained_weights] * 4, dim=1)
-            if new_weights.shape[1] > 12:
-                new_weights = new_weights[:, :12, :, :]
-            elif new_weights.shape[1] < 12:
-                pass
+            original_weights = original_conv1.weight.data
+            # Remove the weights corresponding to the 10th channel (index 9)
+            indices_to_keep = [i for i in range(original_weights.shape[1]) if i != 9]
+            new_weights = original_weights[:, indices_to_keep, :, :]
+
+            # Create a new first convolutional layer with 12 input channels
+            self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
+                                            kernel_size=original_conv1.kernel_size,
+                                            stride=original_conv1.stride,
+                                            padding=original_conv1.padding,
+                                            bias=False if original_conv1.bias is None else True)
+
+            # Initialize the weights of the new first layer with the modified pre-trained weights
             self.resnet50.conv1.weight.data = new_weights
+
+            # Freeze earlier layers (excluding the classifier)
             for name, param in self.resnet50.named_parameters():
                 if name not in ['fc.weight', 'fc.bias']:
                     param.requires_grad = False
+        else:
+            # If not pretrained, initialize the first conv layer for 12 channels
+            self.resnet50.conv1 = nn.Conv2d(12, original_conv1.out_channels,
+                                            kernel_size=original_conv1.kernel_size,
+                                            stride=original_conv1.stride,
+                                            padding=original_conv1.padding,
+                                            bias=False if original_conv1.bias is None else True)
+            nn.init.kaiming_normal_(self.resnet50.conv1.weight, mode='fan_out', nonlinearity='relu')
+
         num_ftrs = self.resnet50.fc.in_features
         self.resnet50.fc = nn.Linear(num_ftrs, num_classes)
 
@@ -196,7 +214,177 @@ class WarmupLR(_LRScheduler):
             # After warmup, keep the target learning rate
             return self.base_lrs
 
+class TransformedDataset(Dataset):
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        data, label = self.dataset[idx]
+        if self.transform:
+            data = self.transform(data)
+        return data, label
+
+def objective(trial):
+    # --- Configuration (Tunable Hyperparameters) ---
+    image_size = trial.suggest_categorical('image_size', [128, 256, 512])
+    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True)
+    weight_decay = trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True)
+    optimizer_name = trial.suggest_categorical('optimizer', ['AdamW', 'Adam'])
+
+    seed = 1337
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    root_directory = "./ds/images/remote_sensing/otherDatasets/sentinel_2/tif"  # Replace with your actual data path
+    num_epochs = 15  # Train for a few epochs during optimization
+    warmup_epochs = 1
+    initial_warmup_lr = 1e-6
+    num_workers = 8
+    train_ratio = 0.8
+    val_ratio = 0.1
+    test_ratio = 0.1
+    patience = 3
+
+    # --- Create Dataset ---
+    full_dataset = Sentinel2Folder(root_directory)
+    valid_indices = [i for i in range(len(full_dataset)) if full_dataset[i][0] is not None]
+    from torch.utils.data import Subset
+    total_size = len(valid_indices)
+    train_size = int(train_ratio * total_size)
+    val_size = int(val_ratio * total_size)
+    train_indices = valid_indices[:train_size]
+    val_indices = valid_indices[train_size:train_size + val_size]
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    num_classes = full_dataset.num_classes
+
+    # --- Calculate Mean and Std ---
+    dataloader_temp = DataLoader(train_dataset, batch_size=len(train_dataset), shuffle=False, num_workers=num_workers)
+    num_bands = 12
+    total_sum = torch.zeros(num_bands)
+    total_squared_sum = torch.zeros(num_bands)
+    total_pixels = 0
+    for data, _ in dataloader_temp:
+        if data is not None:
+            data = data.float()
+            total_sum += torch.sum(data, dim=(0, 2, 3))
+            total_squared_sum += torch.sum(data ** 2, dim=(0, 2, 3))
+            total_pixels += data.numel() // num_bands
+    train_mean = total_sum / total_pixels
+    train_std = torch.sqrt((total_squared_sum / total_pixels) - (train_mean ** 2))
+
+    # --- Define Data Transforms ---
+    train_transforms = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(degrees=30),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=train_mean.tolist(), std=train_std.tolist()),
+    ])
+    val_transforms = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=train_mean.tolist(), std=train_std.tolist()),
+    ])
+    train_dataset.transform = train_transforms
+    val_dataset.transform = val_transforms
+
+    # --- Create DataLoaders ---
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                              generator=torch.Generator().manual_seed(seed))
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # --- Determine Device ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Create Model and Optimizer ---
+    model = ResNet50Sentinel2(num_classes=num_classes, pretrained=True).to(device)
+    unfreeze_all_layers(model) # Ensure all layers are trainable for optimization
+
+    if optimizer_name == 'AdamW':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == 'Adam':
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Invalid optimizer name: {optimizer_name}")
+
+    criterion = nn.CrossEntropyLoss()
+    warmup_steps_per_epoch = len(train_loader)
+    total_warmup_steps = warmup_steps_per_epoch * warmup_epochs
+    warmup_scheduler = WarmupLR(optimizer, total_warmup_steps, initial_warmup_lr, learning_rate)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience, verbose=False)
+
+    # --- Training Loop ---
+    best_val_accuracy = 0.0
+    for epoch in range(num_epochs):
+        model.train()
+        for batch_idx, (data, targets) in enumerate(train_loader):
+            if data is None:
+                continue
+            data = data.to(device)
+            targets = targets.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, targets)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            warmup_scheduler.step()
+
+        # --- Validation ---
+        model.eval()
+        correct_val_predictions = 0
+        total_val_samples = 0
+        with torch.no_grad():
+            for data, targets in val_loader:
+                if data is None:
+                    continue
+                data = data.to(device)
+                targets = targets.to(device)
+                outputs = model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total_val_samples += targets.size(0)
+                correct_val_predictions += (predicted == targets).sum().item()
+
+        val_accuracy = correct_val_predictions / total_val_samples if total_val_samples > 0 else 0
+        scheduler.step(0) # Optuna needs a metric to optimize, using 0 here as ReduceLROnPlateau needs a loss
+
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+
+        trial.report(val_accuracy, epoch)
+
+        # Handle pruning based on intermediate results
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+    return best_val_accuracy
+
 if __name__ == '__main__':
+    # study = optuna.create_study(direction='maximize')
+    # study.optimize(objective, n_trials=10)  # Adjust n_trials as needed
+    #
+    # print("Number of finished trials: {}".format(len(study.trials)))
+    # print("Best trial:")
+    # trial = study.best_trial
+    # print("  Value: {}".format(trial.value))
+    # print("  Params: {}".format(trial.params))
+    #
+    # # --- Train the best model with the found hyperparameters for more epochs ---
+    # best_image_size = trial.params['image_size']
+    # best_batch_size = trial.params['batch_size']
+    # best_learning_rate = trial.params['learning_rate']
+    # best_weight_decay = trial.params['weight_decay']
+    # best_optimizer_name = trial.params['optimizer']
     # --- Configuration ---
     seed = 1337
     random.seed(seed)
@@ -208,9 +396,9 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = False
     root_directory = "./ds/images/remote_sensing/otherDatasets/sentinel_2/tif"  # Replace with your actual data path
     batch_size = 16  # Experiment with this
-    image_size = 1024
-    learning_rate = 0.0001
-    weight_decay = 0.005
+    image_size = 256
+    learning_rate = 0.0001454759712929969
+    weight_decay = 1.1104061061403061e-05
     num_epochs = 100
     warmup_epochs = 5  # Number of warmup epochs
     initial_warmup_lr = 1e-6  # Very small initial learning rate
@@ -249,55 +437,29 @@ if __name__ == '__main__':
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(degrees=30),
-        transforms.ToTensor(),
+        #CALCULATE THIS TOMORROW
         #transforms.Normalize(mean=train_mean, std=train_std),
         # Add more transformations as needed
     ])
 
     val_transforms = transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
         # transforms.Normalize(mean=train_mean, std=train_std),
     ])
 
     test_transforms = transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
         # transforms.Normalize(mean=train_mean, std=train_std),
     ])
 
-    train_dataset.transform = train_transforms
-    val_dataset.transform = val_transforms
-    test_dataset.transform = test_transforms
+    train_dataset = TransformedDataset(train_dataset, train_transforms)
+    val_dataset = TransformedDataset(val_dataset, val_transforms)
+    test_dataset = TransformedDataset(test_dataset, test_transforms)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                               generator=torch.Generator().manual_seed(seed))
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    print("Calculating mean and standard deviation of the training dataset...")
-    num_bands = 12
-    total_sum = torch.zeros(num_bands)
-    total_squared_sum = torch.zeros(num_bands)
-    total_pixels = 0
-    for batch_idx, (data, targets) in enumerate(train_loader):
-        if data is not None:
-            # Data shape: [batch_size, num_channels, height, width]
-            # We have only one batch here since batch_size = len(train_dataset)
-            data = data.float()  # Ensure data is float for calculations
-            total_sum += torch.sum(data, dim=(0, 2, 3))  # Sum over batch, height, and width
-            total_squared_sum += torch.sum(data ** 2, dim=(0, 2, 3))
-            total_pixels += data.numel() // num_bands
-
-    train_mean = total_sum / total_pixels
-    train_std = torch.sqrt((total_squared_sum / total_pixels) - (train_mean ** 2))
-
-
-
-    # --- Create Dataset ---
-    # ... (splitting dataset)
-
-
     # --- Determine Device ---
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -308,7 +470,7 @@ if __name__ == '__main__':
     print(f"Using device: {device}")
 
     # --- Create Model and Move to Device ---
-    model = ResNet50Sentinel2(num_classes=num_classes, pretrained=True).to(device)
+    model = ConvNeXtSentinel2(num_classes=num_classes, pretrained=True).to(device)
 
     unfreeze_all_layers(model)
     check_frozen_layers(model) # Verify that all are unfrozen
