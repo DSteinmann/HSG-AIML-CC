@@ -370,6 +370,7 @@ def objective(trial):
     return best_val_accuracy
 
 if __name__ == '__main__':
+
     # study = optuna.create_study(direction='maximize')
     # study.optimize(objective, n_trials=10)  # Adjust n_trials as needed
     #
@@ -396,9 +397,9 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = False
     root_directory = "./ds/images/remote_sensing/otherDatasets/sentinel_2/tif"  # Replace with your actual data path
     batch_size = 16  # Experiment with this
-    image_size = 256
-    learning_rate = 0.0001454759712929969
-    weight_decay = 1.1104061061403061e-05
+    image_size = 128
+    learning_rate = 4.98591870662795e-05
+    weight_decay = 0.0011119225534957733
     num_epochs = 100
     warmup_epochs = 5  # Number of warmup epochs
     initial_warmup_lr = 1e-6  # Very small initial learning rate
@@ -407,6 +408,37 @@ if __name__ == '__main__':
     val_ratio = 0.1
     test_ratio = 0.1
     patience = 5  # Number of epochs to wait for improvement
+
+    # Create the training dataset (without any normalization transforms yet)
+    train_dataset = Sentinel2Folder(root_directory, transform=transforms.Resize((image_size, image_size)))
+
+    # Create a DataLoader to load the entire dataset (or a large enough sample)
+    # Set batch_size to a large number to process as much data as possible at once
+    dataloader = DataLoader(train_dataset, batch_size=len(train_dataset), shuffle=False, num_workers=num_workers)
+
+    num_bands = 12  # Number of channels in your Sentinel-2 data (after removing the 10th band)
+    total_sum = torch.zeros(num_bands)
+    total_squared_sum = torch.zeros(num_bands)
+    total_pixels = 0
+
+    print("Calculating mean and standard deviation...")
+
+    for batch_idx, (data, _) in enumerate(dataloader):
+        if data is not None:
+            # Data will have shape (batch_size, num_channels, height, width)
+            data = data.float()  # Ensure data is float for calculations
+            total_sum += torch.sum(data, dim=(0, 2, 3))
+            total_squared_sum += torch.sum(data ** 2, dim=(0, 2, 3))
+            total_pixels += data.numel() // num_bands
+
+    if total_pixels > 0:
+        train_mean = total_sum / total_pixels
+        train_std = torch.sqrt((total_squared_sum / total_pixels) - (train_mean ** 2))
+
+        print(f"Calculated Mean: {train_mean.tolist()}")
+        print(f"Calculated Standard Deviation: {train_std.tolist()}")
+    else:
+        print("Error: No data found in the training dataset.")
 
     # --- Create Dataset ---
     full_dataset = Sentinel2Folder(root_directory)
@@ -438,13 +470,13 @@ if __name__ == '__main__':
         transforms.RandomVerticalFlip(),
         transforms.RandomRotation(degrees=30),
         #CALCULATE THIS TOMORROW
-        #transforms.Normalize(mean=train_mean, std=train_std),
+        transforms.Normalize(mean=train_mean, std=train_std),
         # Add more transformations as needed
     ])
 
     val_transforms = transforms.Compose([
         transforms.Resize((image_size, image_size)),
-        # transforms.Normalize(mean=train_mean, std=train_std),
+        transforms.Normalize(mean=train_mean, std=train_std),
     ])
 
     test_transforms = transforms.Compose([

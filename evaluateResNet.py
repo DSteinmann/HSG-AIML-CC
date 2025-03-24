@@ -168,7 +168,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False) # No need to shuffle for evaluation
 
     # --- Load the Model ---
-    model = ResNet50Sentinel2(num_classes=num_classes)
+    model = ConvNeXtSentinel2(num_classes=num_classes)
     model.load_state_dict(torch.load(model_path))
     model.eval() # Set the model to evaluation mode
 
