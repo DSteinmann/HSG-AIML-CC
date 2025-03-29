@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from Res2Model import Sentinel2Folder
+from Res2Model import Sentinel2Dataset
 
 if __name__ == '__main__':
     root_directory = "./ds/images/remote_sensing/otherDatasets/sentinel_2/tif"  # Replace with your actual training data path
@@ -11,7 +11,7 @@ if __name__ == '__main__':
     batch_size = 64  # Adjust this batch size based on your memory capacity
 
     # Create the training dataset (without any normalization transforms yet)
-    train_dataset = Sentinel2Folder(root_directory, transform=transforms.Resize((image_size, image_size)))
+    train_dataset = Sentinel2Dataset(root_directory, transform=transforms.Resize((image_size, image_size)))
 
     # Create a DataLoader to load the entire dataset (or a large enough sample)
     # Set batch_size to a large number to process as much data as possible at once
