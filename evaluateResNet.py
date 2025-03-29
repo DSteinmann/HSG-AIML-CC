@@ -7,9 +7,35 @@ import os
 import numpy as np
 import pandas as pd
 from torchgeo.models import resnet50, ResNet152_Weights, ResNet50_Weights
+from torchvision import models
 from torchvision.models import resnext101_32x8d, convnext_large, ConvNeXt_Large_Weights, convnext_base, \
     ConvNeXt_Base_Weights, resnet101, ResNet101_Weights
 from torchvision.transforms import transforms
+
+train_mean = [1353.727294921875,
+              1117.2015380859375,
+              1041.88427734375,
+              946.5543212890625,
+              1199.1885986328125,
+              2003.0074462890625,
+              2374.008056640625,
+              2301.218994140625,
+              732.1814575195312,
+              1820.696044921875,
+              1118.202392578125,
+              2599.78369140625]
+train_std = [245.2095947265625,
+             327.2839050292969,
+             388.6127624511719,
+             586.9910888671875,
+             565.8442993164062,
+             859.5098876953125,
+             1085.123291015625,
+             1108.106689453125,
+             403.7764587402344,
+             1001.4296875,
+             759.4329833984375,
+             1229.7283935546875]
 
 
 class ResNet50Sentinel2(nn.Module):
@@ -58,46 +84,89 @@ class ResNet50Sentinel2(nn.Module):
     def forward(self, x):
         return self.resnet50(x)
 
+# --- Model Definition (ConvNeXt adapted for 12->3 channels internally) ---
 class ConvNeXtSentinel2(nn.Module):
-    def __init__(self, num_classes, pretrained=False):
+    """ ConvNeXt model adapted for 12-channel input using an initial 1x1 conv. """
+    def __init__(self, num_classes, pretrained=True):
         super().__init__()
-        self.convnext = convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT if pretrained else None)
+        # --- 1. Define the 1x1 Channel Projector ---
+        self.channel_projector = nn.Conv2d(12, 3, kernel_size=1, bias=False)
 
-        first_conv_layer = self.convnext.features[0][0]
-        original_out_channels = first_conv_layer.out_channels
-        original_kernel_size = first_conv_layer.kernel_size
-        original_stride = first_conv_layer.stride
-        original_padding = first_conv_layer.padding
-        original_bias = first_conv_layer.bias is not None
+        # --- 2. Load base ConvNeXt model ---
+        self.convnext_base = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT if pretrained else None)
 
-        self.convnext.features[0][0] = nn.Conv2d(
-            12,
-            original_out_channels,
-            kernel_size=original_kernel_size,
-            stride=original_stride,
-            padding=original_padding,
-            bias=original_bias
-        )
-
+        # --- 3. Initialize Projector Weights ---
         if pretrained:
-            # Initialize weights for the new first layer (12 input channels)
-            nn.init.kaiming_normal_(self.convnext.features[0][0].weight, mode='fan_out', nonlinearity='relu')
-            if self.convnext.features[0][0].bias is not None:
-                nn.init.zeros_(self.convnext.features[0][0].bias)
+            print("Initializing 1x1 channel projector weights...")
+            with torch.no_grad():
+                # Use spatially averaged weights from ResNet50 conv1 as a starting point
+                try:
+                    rn_weights = ResNet50_Weights.IMAGENET1K_V1.get_state_dict()['conv1.weight']
+                    rn_weights_avg = rn_weights.mean(dim=[2, 3]) # Avg spatial dims -> [64, 3]
+                    proj_weights = self.channel_projector.weight.data # [3, 12, 1, 1]
+                    proj_weights.zero_()
+                    for out_ch in range(3):
+                        for in_ch in range(12):
+                            source_out_ch = out_ch
+                            source_in_ch = in_ch % 3
+                            proj_weights[out_ch, in_ch, 0, 0] = rn_weights_avg[source_out_ch, source_in_ch]
+                    print("Initialized conv1x1 using averaged ResNet weights.")
+                except Exception as init_e:
+                    print(f"Warning: Failed to initialize conv1x1 from ResNet ({init_e}). Using Kaiming init.")
+                    nn.init.kaiming_normal_(self.channel_projector.weight, mode='fan_out', nonlinearity='relu')
 
-            # Optionally freeze earlier layers (excluding the classifier)
-            for name, param in self.convnext.named_parameters():
-                if 'classifier' not in name: # You might need to adjust this based on the exact layer names
-                    param.requires_grad = False
+        # --- 4. Store original components (if needed, but likely not) ---
+        # self.features = self.convnext_base.features # Direct access might change
+        # self.avgpool = self.convnext_base.avgpool
+        # original_classifier = self.convnext_base.classifier
 
-        num_features = self.convnext.classifier[-1].in_features
-        self.convnext.classifier[-1] = nn.Linear(num_features, num_classes)
-        nn.init.normal_(self.convnext.classifier[-1].weight, 0, 0.01)
-        nn.init.zeros_(self.convnext.classifier[-1].bias)
+        # --- 5. Replace the classifier ---
+        num_features_in = self.convnext_base.classifier[-1].in_features
+        self.convnext_base.classifier = nn.Sequential(
+             # Keep structure similar if needed (LayerNorm, Flatten)
+             self.convnext_base.classifier[0], # LayerNorm
+             self.convnext_base.classifier[1], # Flatten
+             nn.Dropout(p=0.5),
+             nn.Linear(num_features_in, num_classes)
+        )
+        print(f"Replaced classifier head for {num_classes} classes.")
 
-    def forward(self, x):
-        return self.convnext(x)
+        # --- 6. Initialize New Classifier Head ---
+        nn.init.normal_(self.convnext_base.classifier[-1].weight, 0, 0.01)
+        nn.init.zeros_(self.convnext_base.classifier[-1].bias)
 
+        # --- 7. Set requires_grad for Fine-Tuning ---
+        print("Configuring model for fine-tuning...")
+        # Freeze everything initially
+        for param in self.parameters():
+            param.requires_grad = False
+        # Unfreeze the projector, pre-classifier norm (if exists), and classifier
+        for param in self.channel_projector.parameters(): # Unfreeze projector
+            param.requires_grad = True
+        for param in self.convnext_base.classifier.parameters(): # Unfreeze new classifier
+            param.requires_grad = True
+
+        # Unfreeze the last stage of the backbone
+        if hasattr(self.convnext_base, 'features') and isinstance(self.convnext_base.features, nn.Sequential):
+            last_stage_idx = -1
+            for i in range(len(self.convnext_base.features) - 1, -1, -1):
+                 if isinstance(self.convnext_base.features[i], (nn.Sequential, models.convnext.CNBlock)):
+                     last_stage_idx = i
+                     break
+            if last_stage_idx != -1:
+                for param in self.convnext_base.features[last_stage_idx].parameters():
+                    param.requires_grad = True
+                print(f"Unfroze channel_projector, classifier, and last stage (idx {last_stage_idx}).")
+            else:
+                 print("Unfroze channel_projector and classifier only.")
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. Project 12 channels to 3
+        x = self.channel_projector(x)
+        # 2. Pass through the *original* ConvNeXt base model's forward path
+        x = self.convnext_base(x) # This will use the modified classifier internally
+        return x
 
 # --- Test Dataset for .npy files ---
 class TestDatasetNPY(Dataset):
@@ -138,7 +207,7 @@ class TestDatasetNPY(Dataset):
 
 def main():
     # --- Configuration ---
-    model_path = "convnext_sentinel2_trained_best.pth"  # Path to your trained model file
+    model_path = "convnext_final_model.pth"  # Path to your trained model file
     test_data_dir = "./testset/testset"  # Path to the directory containing .npy test files
     output_csv_path = "_track2.csv"
     num_classes = 10  # Replace with the number of classes your model was trained on
@@ -160,15 +229,15 @@ def main():
 
     # --- Create Test Dataset ---
     test_transforms = transforms.Compose([
-        transforms.Resize((256, 256))
-        # CALCULATE MEAN AND STD TOMORROW
+        transforms.Resize((256, 256)),
+        transforms.Normalize(mean=train_mean, std=train_std)
     ])
 
     test_dataset = TestDatasetNPY(test_data_dir, label_map=label_map, transform=test_transforms)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False) # No need to shuffle for evaluation
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False) # No need to shuffle for evaluation
 
     # --- Load the Model ---
-    model = ConvNeXtSentinel2(num_classes=num_classes)
+    model = ConvNeXtSentinel2(num_classes=num_classes, pretrained=False)
     model.load_state_dict(torch.load(model_path))
     model.eval() # Set the model to evaluation mode
 
