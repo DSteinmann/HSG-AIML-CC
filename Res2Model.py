@@ -20,8 +20,8 @@ if not os.path.exists('./outputs'):
 
 # Define the paths
 train_dir = './ds/images/remote_sensing/otherDatasets/sentinel_2/tif'
-validation_dir = './testset/testset'  # Test data (.npy files) for final prediction
-model_save_path = 'convnext_staged_imgnorm.pth' # New name for this version
+validation_dir = './testset/testset'
+model_save_path = 'convnext_2stage_imgnorm.pth' # New name for this strategy
 predictions_csv_path = 'track_2.csv'
 
 USE_CUDA = torch.cuda.is_available()
@@ -41,23 +41,24 @@ torch.backends.cudnn.benchmark = False
 
 best_image_size = 256
 best_batch_size = 64
-best_weight_decay =  3.7553e-05 # Keep from previous attempt
+best_weight_decay = 3.7553e-05 # Reverted to previous value
 best_optimizer_name = 'AdamW'
 
-# Staged Learning Rates & Epochs (Keep same as before, adjust if needed)
-lr_stage1 = 1e-4
-lr_stage2 = 3e-5
-lr_stage3 = 1e-5
-stage1_epochs = 10
-stage2_epochs = 20
-stage3_epochs = 20
-num_epochs = stage1_epochs + stage2_epochs + stage3_epochs # Total max
+# Learning Rates for 2 Stages
+lr_stage1 = 1e-4 # Train head + projector
+lr_stage2 = 2e-6 # Fine-tune ALL layers (very low LR)
 
+stage1_epochs = 15  # Train head/projector a bit longer
+stage2_epochs = 50  # Allow more time for full fine-tuning
+
+num_epochs = stage1_epochs + stage2_epochs # Total max
+
+# Warmup only for Stage 1
 warmup_epochs = 3
 initial_warmup_lr = 1e-6
 num_workers = 4
 train_ratio = 0.9
-patience = 7
+patience = 10 # Early stopping patience per stage (increased slightly)
 # num_classes determined from data scan
 
 # --- REMOVED Global Normalization Stats ---
@@ -79,12 +80,14 @@ def load_sentinel2_image(filepath):
         elif image.shape[0] != 12:
              raise ValueError(f"Unexpected shape for .npy {filepath}: {image.shape}")
     else:
-        raise ValueError("Unsupported file type.")
+        raise ValueError(f"Unsupported file type: {filepath}")
     return image.astype(np.float32)
 
 # --- Per-Image Normalization Function ---
 def normalize_image_per_image(image_np):
     """Normalizes 12-channel NumPy image (C, H, W) using its own stats."""
+    if image_np.ndim != 3 or image_np.shape[0] != 12:
+         raise ValueError(f"Invalid shape for per-image normalization: {image_np.shape}. Expected (12, H, W).")
     mean = np.mean(image_np, axis=(1, 2), keepdims=True)
     std = np.std(image_np, axis=(1, 2), keepdims=True)
     normalized_image = (image_np - mean) / (std + 1e-7) # Add epsilon
@@ -96,7 +99,6 @@ class Sentinel2Dataset(Dataset):
     def __init__(self, paths_labels, transform=None):
         self.paths_labels = paths_labels
         self.transform = transform
-        # Class info handled globally
 
     def __len__(self):
         return len(self.paths_labels)
@@ -107,7 +109,7 @@ class Sentinel2Dataset(Dataset):
             image_np = load_sentinel2_image(image_path) # NumPy (C, H, W)
             image_np = normalize_image_per_image(image_np) # Apply per-image normalization HERE
 
-            image_tensor = torch.from_numpy(image_np).float() # Convert to tensor
+            image_tensor = torch.from_numpy(image_np.copy()).float() # Convert to tensor AFTER normalization
             label_tensor = torch.tensor(label, dtype=torch.long)
 
             if self.transform:
@@ -118,9 +120,9 @@ class Sentinel2Dataset(Dataset):
         except Exception as e:
             print(f"Error loading/processing image {image_path}:")
             traceback.print_exc()
-            return None, None, None
+            return None, None, None # Signal error
 
-# Prediction dataset also uses per-image normalization via transforms
+# Prediction dataset also uses per-image normalization
 class NpyPredictionDataset(Dataset):
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
@@ -137,7 +139,7 @@ class NpyPredictionDataset(Dataset):
         try:
             image_np = load_sentinel2_image(image_path) # NumPy (C, H, W)
             image_np = normalize_image_per_image(image_np) # Apply per-image normalization HERE
-            image_tensor = torch.from_numpy(image_np).float() # Convert to tensor
+            image_tensor = torch.from_numpy(image_np.copy()).float() # Convert to tensor
 
             if self.transform:
                 image_tensor = self.transform(image_tensor) # Apply remaining transforms
@@ -150,15 +152,14 @@ class NpyPredictionDataset(Dataset):
             return None, None, None
 
 
-# --- Data Transforms (REVISED - NO Normalize Step) ---
+# --- Data Transforms (REVISED - NO Normalize Step, simple augs) ---
 train_transforms = transforms.Compose([
     # Input is already a normalized 12-channel Tensor from __getitem__
-    # Geometric augmentations work on multi-channel tensors
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
-    transforms.RandomRotation(degrees=30),
+    transforms.RandomRotation(degrees=20), # Keep some rotation
     transforms.Resize((best_image_size, best_image_size), antialias=True),
-    # ColorJitter cannot be used easily on 12 channels
+    # NO Normalize step here
 ])
 
 val_transforms = transforms.Compose([
@@ -199,10 +200,9 @@ train_info, val_info = train_test_split(
 
 # Create Dataset objects using the split lists
 train_dataset = Sentinel2Dataset(train_info, transform=train_transforms)
-val_tif_dataset = Sentinel2Dataset(val_info, transform=val_transforms) # Use val_transforms for internal val
+val_tif_dataset = Sentinel2Dataset(val_info, transform=val_transforms)
+final_validation_dataset = NpyPredictionDataset(validation_dir, transform=val_transforms) # Prediction set
 
-# Dataset for final predictions
-final_validation_dataset = NpyPredictionDataset(validation_dir, transform=val_transforms) # Use val_transforms
 
 # --- Create DataLoaders ---
 def collate_fn(batch):
@@ -215,8 +215,8 @@ def collate_fn(batch):
         paths = [item[2] for item in batch]
         return images, labels, paths
     except Exception as e:
-        print(f"Error in collate_fn: {e}")
-        traceback.print_exc()
+        print(f"Error in collate_fn: {e}. Skipping batch.")
+        # traceback.print_exc() # Can be verbose
         return None, None, None
 
 train_loader = DataLoader(train_dataset, batch_size=best_batch_size, shuffle=True, num_workers=num_workers, generator=torch.Generator().manual_seed(seed), pin_memory=True, collate_fn=collate_fn)
@@ -233,9 +233,8 @@ class ConvNeXtSentinel2(nn.Module):
         self.channel_projector = nn.Conv2d(12, 3, kernel_size=1, bias=False)
         self.convnext_base = models.convnext_base(weights=ConvNeXt_Base_Weights.DEFAULT if pretrained else None)
         if pretrained:
-            # print("Initializing 1x1 channel projector weights...") # Less verbose
             with torch.no_grad():
-                try: # Init using averaged ResNet weights
+                try: # Init projector using averaged ResNet weights
                     rn_weights = ResNet50_Weights.IMAGENET1K_V1.get_state_dict()['conv1.weight']
                     rn_weights_avg = rn_weights.mean(dim=[2, 3])
                     proj_weights = self.channel_projector.weight.data
@@ -243,27 +242,27 @@ class ConvNeXtSentinel2(nn.Module):
                     for out_ch in range(3):
                         for in_ch in range(12):
                             proj_weights[out_ch, in_ch, 0, 0] = rn_weights_avg[out_ch % 64, in_ch % 3]
-                    # print("Initialized conv1x1 using averaged ResNet weights.")
                 except Exception as init_e:
-                    print(f"Warning: Failed init conv1x1 from ResNet ({init_e}). Using Kaiming.")
+                    print(f"Warning: Init conv1x1 failed ({init_e}). Using Kaiming init.")
                     nn.init.kaiming_normal_(self.channel_projector.weight, mode='fan_out', nonlinearity='relu')
         num_features_in = self.convnext_base.classifier[-1].in_features
         self.convnext_base.classifier = nn.Sequential(
              self.convnext_base.classifier[0], # Keep LayerNorm
              self.convnext_base.classifier[1], # Keep Flatten
-             nn.Dropout(p=0.5),              # Add dropout
+             nn.Dropout(p=0.5),              # Keep dropout
              nn.Linear(num_features_in, num_classes) # New Linear layer
         )
+        # Initialize the new classifier head weights
         nn.init.normal_(self.convnext_base.classifier[-1].weight, 0, 0.01)
         nn.init.zeros_(self.convnext_base.classifier[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.channel_projector(x) # 12 -> 3 channels
-        x = self.convnext_base(x) # Pass 3ch tensor to standard ConvNeXt
+        x = self.convnext_base(x)     # Pass 3ch tensor to standard ConvNeXt
         return x
 
 # --- Helper Function for Training/Validation Epoch ---
-def run_epoch(model, loader, criterion, optimizer, scaler, device, is_training, epoch_num, num_epochs_total, warmup_scheduler=None, current_stage_epoch=0, total_warmup_epochs=0):
+def run_epoch(model, loader, criterion, optimizer, scaler, device, is_training, epoch_num, num_epochs_total, current_lr, warmup_scheduler=None, current_stage_epoch=0, total_warmup_epochs=0):
     """Runs a single epoch of training or validation."""
     if is_training: model.train()
     else: model.eval()
@@ -273,43 +272,57 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, is_training, 
     start_time = time.time()
     context = torch.no_grad() if not is_training else torch.enable_grad()
     loader_desc = "Training" if is_training else "Validation"
-    with context:
-        for batch_idx, batch_data in enumerate(loader):
-            if batch_data is None or batch_data[0] is None: continue
-            inputs, targets, _ = batch_data # Unpack
-            inputs, targets = inputs.to(device), targets.to(device)
-            with torch.amp.autocast(device_type=device.type, enabled=USE_CUDA):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-            if is_training:
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"WARNING: NaN/Inf loss at E{epoch_num} B{batch_idx+1}. Skip.")
-                    optimizer.zero_grad(set_to_none=True); continue
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                # Optional Clipping
-                # scaler.unscale_(optimizer)
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                if warmup_scheduler and epoch_num <= total_warmup_epochs: warmup_scheduler.step()
-            running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            total_samples += targets.size(0)
-            correct_predictions += (predicted == targets).sum().item()
-            if is_training and (batch_idx + 1) % 100 == 0: print(f'  E{epoch_num} Step [{batch_idx + 1}/{len(loader)}], Loss: {loss.item():.4f}')
+
+    print(f'---> Starting Epoch {epoch_num}/{num_epochs_total} ({loader_desc}) | LR: {current_lr:.4e}')
+
+    for batch_idx, batch_data in enumerate(loader):
+        if batch_data is None or batch_data[0] is None: continue
+        inputs, targets, _ = batch_data # Unpack
+
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+
+        # Autocast for forward pass
+        with torch.amp.autocast(device_type=device.type, enabled=USE_CUDA):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+        if is_training:
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"WARNING: NaN/Inf loss detected at E{epoch_num} B{batch_idx+1}. Skipping update.")
+                optimizer.zero_grad(set_to_none=True); continue
+            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            # Optional Clipping
+            # scaler.unscale_(optimizer)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            # Step iteration-level scheduler (warmup phase) ONLY during warmup epochs of stage 1
+            if warmup_scheduler and epoch_num <= total_warmup_epochs:
+                warmup_scheduler.step()
+
+
+        running_loss += loss.item() * inputs.size(0)
+        _, predicted = torch.max(outputs.data, 1)
+        total_samples += targets.size(0)
+        correct_predictions += (predicted == targets).sum().item()
+
+        # Print less often
+        # if is_training and (batch_idx + 1) % 100 == 0:
+        #      print(f'  E{epoch_num} Step [{batch_idx + 1}/{len(loader)}], Loss: {loss.item():.4f}')
+
     epoch_duration = time.time() - start_time
     avg_loss = running_loss / total_samples if total_samples > 0 else 0
     accuracy = 100. * correct_predictions / total_samples if total_samples > 0 else 0
     print(f'Epoch [{epoch_num}/{num_epochs_total}] FINISHED ({loader_desc}) - Loss: {avg_loss:.4f}, Acc: {accuracy:.2f}%, Time: {epoch_duration:.2f}s')
     return avg_loss, accuracy
 
-
 # --- Main Execution Logic ---
 if __name__ == '__main__':
 
     # --- Create Model ---
-    model = ConvNeXtSentinel2(num_classes=num_classes, pretrained=True) # Use the specific class
+    model = ConvNeXtSentinel2(num_classes=num_classes, pretrained=True)
     model.to(DEVICE)
 
     # --- Loss Function ---
@@ -321,8 +334,9 @@ if __name__ == '__main__':
     total_epochs_run = 0
     scaler = torch.amp.GradScaler(device=DEVICE.type, enabled=USE_CUDA) # Correct syntax
 
-    # --- Stage 1 ---
+    # --- Stage 1: Train Projector + Head ---
     print("\n--- Stage 1: Training Projector and Classifier Head ---")
+    stage = 1
     stage_epochs = stage1_epochs
     stage_lr = lr_stage1
     # Configure requires_grad for Stage 1
@@ -332,148 +346,89 @@ if __name__ == '__main__':
         else:
             param.requires_grad = False
     print(f"Trainable parameters for Stage 1: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=stage_lr,
-                            weight_decay=best_weight_decay)
+
+    # Define optimizer with ONLY trainable parameters for this stage
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=stage_lr, weight_decay=best_weight_decay)
+
+    # Warmup only for the first stage
     if warmup_epochs > 0:
-        warmup_steps_per_epoch_st1 = len(train_loader);
-        total_warmup_steps_st1 = warmup_steps_per_epoch_st1 * warmup_epochs
-        lr_lambda = lambda cs: initial_warmup_lr / stage_lr * (
-                    1.0 - float(cs + 1) / float(max(1, total_warmup_steps_st1))) + float(cs + 1) / float(
-            max(1, total_warmup_steps_st1)) if cs < total_warmup_steps_st1 else 1.0
-        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda);
-        print(f"Using linear warmup for {warmup_epochs} epochs in Stage 1.")
-    else:
-        warmup_scheduler = None
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience // 2,
-                                                           verbose=False)
-    epochs_without_improvement = 0
+        warmup_steps_per_epoch_st1 = len(train_loader); total_warmup_steps_st1 = warmup_steps_per_epoch_st1 * warmup_epochs
+        lr_lambda = lambda cs: initial_warmup_lr / stage_lr * (1.0-float(cs+1)/float(max(1,total_warmup_steps_st1))) + float(cs+1)/float(max(1,total_warmup_steps_st1)) if cs<total_warmup_steps_st1 else 1.0
+        warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda); print(f"Using linear warmup for {warmup_epochs} epochs in Stage 1.")
+    else: warmup_scheduler = None
+    # Plateau scheduler for this stage
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience // 2, verbose=False)
+    epochs_without_improvement = 0 # Reset for stage
 
     for epoch in range(stage_epochs):
         epoch_num = total_epochs_run + 1
-        run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, True, epoch_num, num_epochs,
-                  warmup_scheduler, epoch, warmup_epochs)
-        avg_val_loss, val_accuracy = run_epoch(model, val_loader_split, criterion, None, scaler, DEVICE, False,
-                                               epoch_num, num_epochs)
-        if epoch >= warmup_epochs: scheduler.step(avg_val_loss)
-        print(f'End of Epoch {epoch_num} - Current LR: {optimizer.param_groups[0]["lr"]:.6e}')
+        current_lr = optimizer.param_groups[0]['lr'] # Get LR before epoch run
+        run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, True, epoch_num, num_epochs, current_lr, warmup_scheduler, epoch, warmup_epochs)
+        avg_val_loss, val_accuracy = run_epoch(model, val_loader_split, criterion, None, scaler, DEVICE, False, epoch_num, num_epochs, current_lr)
+
+        # Step plateau scheduler AFTER warmup phase
+        if epoch_num > warmup_epochs: scheduler.step(avg_val_loss)
+
+        print(f'End of Epoch {epoch_num} - Current LR: {optimizer.param_groups[0]["lr"]:.6e}') # Print LR after step
+
         if avg_val_loss < overall_best_val_loss:
-            overall_best_val_loss = avg_val_loss;
-            epochs_without_improvement = 0
-            best_model_state_dict = model.state_dict();
-            torch.save(best_model_state_dict, model_save_path)
+            overall_best_val_loss = avg_val_loss; epochs_without_improvement = 0
+            best_model_state_dict = model.state_dict(); torch.save(best_model_state_dict, model_save_path)
             print(f'---> Overall Validation Loss Improved to {overall_best_val_loss:.4f}, model saved.')
         else:
-            epochs_without_improvement += 1;
-            print(f'---> Stage 1 Val loss did not improve for {epochs_without_improvement} epochs.')
-            if epochs_without_improvement >= patience: print(
-                f'Early stopping triggered during Stage 1 at epoch {epoch_num}.'); break
+            epochs_without_improvement += 1; print(f'---> Stage {stage} Val loss did not improve for {epochs_without_improvement} epochs.')
+            if epochs_without_improvement >= patience: print(f'Early stopping triggered during Stage {stage} at epoch {epoch_num}.'); break
         total_epochs_run = epoch_num
+    print(f"--- Finished Stage 1 (Epoch {total_epochs_run}) ---")
 
-    # --- Stage 2 ---
-    print("\n--- Stage 2: Unfreezing Last Backbone Stage ---")
-    if best_model_state_dict:
-        model.load_state_dict(best_model_state_dict)
-    else:
-        print("Warning: No best model from Stage 1, continuing with last state.")
-    unfrozen_stage2 = False;
-    last_stage_idx = -1
-    if hasattr(model, 'convnext_base') and hasattr(model.convnext_base, 'features') and isinstance(
-            model.convnext_base.features, nn.Sequential):
-        for i in range(len(model.convnext_base.features) - 1, -1, -1):
-            if isinstance(model.convnext_base.features[i],
-                          (nn.Sequential, models.convnext.CNBlock)): last_stage_idx = i; break
-        if last_stage_idx != -1:
-            for param in model.convnext_base.features[last_stage_idx].parameters(): param.requires_grad = True
-            print(f"Unfroze last backbone stage (index {last_stage_idx}) for Stage 2.")
-            unfrozen_stage2 = True
+
+    # --- Stage 2: Unfreeze ALL and Train with Low LR ---
+    print("\n--- Stage 2: Fine-tuning ALL Layers ---")
+    stage = 2
+    stage_epochs = stage2_epochs # Use stage2_epochs value
+    stage_lr = lr_stage2 # Use the very low LR defined for stage 2
+
+    if best_model_state_dict: model.load_state_dict(best_model_state_dict)
+    else: print("Warning: No best model from Stage 1, continuing with last state.")
+
+    # Unfreeze ALL layers
+    print("Unfreezing all model layers for Stage 2.")
+    for param in model.parameters():
+        param.requires_grad = True
+
+    print(f"Trainable parameters for Stage 2: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    # Create NEW optimizer with all parameters and very low LR
+    optimizer = optim.AdamW(model.parameters(), lr=stage_lr, weight_decay=best_weight_decay) # Use filter or just model.parameters()
+    # Recreate Plateau scheduler for this stage
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience, verbose=False) # Maybe increase patience slightly
+    epochs_without_improvement = 0 # Reset patience count
+
+    for epoch in range(stage_epochs):
+        epoch_num = total_epochs_run + 1
+        current_lr = optimizer.param_groups[0]['lr']
+        # Run epoch - NO warmup needed for stage 2
+        run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, True, epoch_num, num_epochs, current_lr)
+        avg_val_loss, val_accuracy = run_epoch(model, val_loader_split, criterion, None, scaler, DEVICE, False, epoch_num, num_epochs, current_lr)
+
+        scheduler.step(avg_val_loss) # Step epoch-level scheduler
+        print(f'End of Epoch {epoch_num} - Current LR: {optimizer.param_groups[0]["lr"]:.6e}')
+
+        if avg_val_loss < overall_best_val_loss:
+            overall_best_val_loss = avg_val_loss; epochs_without_improvement = 0
+            best_model_state_dict = model.state_dict(); torch.save(best_model_state_dict, model_save_path)
+            print(f'---> Overall Validation Loss Improved to {overall_best_val_loss:.4f}, model saved.')
         else:
-            print("Warning: Could not find last stage to unfreeze.")
+            epochs_without_improvement += 1; print(f'---> Stage {stage} Val loss did not improve for {epochs_without_improvement} epochs.')
+            if epochs_without_improvement >= patience: print(f'Early stopping triggered during Stage {stage} at epoch {epoch_num}.'); break
+        total_epochs_run = epoch_num
+    print(f"--- Finished Stage 2 (Epoch {total_epochs_run}) ---")
 
-    if unfrozen_stage2:
-        print(f"Trainable parameters for Stage 2: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr_stage2,
-                                weight_decay=best_weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience // 2,
-                                                         verbose=False)
-        epochs_without_improvement = 0
-        for epoch in range(stage2_epochs):
-            epoch_num = total_epochs_run + 1
-            run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, True, epoch_num,
-                      num_epochs)  # No warmup
-            avg_val_loss, val_accuracy = run_epoch(model, val_loader_split, criterion, None, scaler, DEVICE, False,
-                                                   epoch_num, num_epochs)
-            scheduler.step(avg_val_loss)
-            print(f'End of Epoch {epoch_num} - Current LR: {optimizer.param_groups[0]["lr"]:.6e}')
-            if avg_val_loss < overall_best_val_loss:
-                overall_best_val_loss = avg_val_loss;
-                epochs_without_improvement = 0
-                best_model_state_dict = model.state_dict();
-                torch.save(best_model_state_dict, model_save_path)
-                print(f'---> Overall Validation Loss Improved to {overall_best_val_loss:.4f}, model saved.')
-            else:
-                epochs_without_improvement += 1;
-                print(f'---> Stage 2 Val loss did not improve for {epochs_without_improvement} epochs.')
-                if epochs_without_improvement >= patience: print(
-                    f'Early stopping triggered during Stage 2 at epoch {epoch_num}.'); break
-            total_epochs_run = epoch_num
-    else:
-        print("Skipping Stage 2 training.")
-
-    # --- Stage 3 ---
-    print("\n--- Stage 3: Unfreezing Second-to-Last Backbone Stage ---")
-    if best_model_state_dict:
-        model.load_state_dict(best_model_state_dict)
-    else:
-        print("Warning: No best model state from previous stages, continuing.")
-    unfrozen_stage3 = False;
-    second_last_stage_idx = -1
-    if hasattr(model, 'convnext_base') and hasattr(model.convnext_base, 'features') and isinstance(
-            model.convnext_base.features, nn.Sequential):
-        stages_found = 0
-        for i in range(len(model.convnext_base.features) - 1, -1, -1):
-            if isinstance(model.convnext_base.features[i], (nn.Sequential, models.convnext.CNBlock)):
-                stages_found += 1
-                if stages_found == 2: second_last_stage_idx = i; break
-        if second_last_stage_idx != -1:
-            for param in model.convnext_base.features[second_last_stage_idx].parameters(): param.requires_grad = True
-            print(f"Unfroze second-to-last backbone stage (index {second_last_stage_idx}) for Stage 3.")
-            unfrozen_stage3 = True
-        else:
-            print("Warning: Could not find second-to-last stage for Stage 3.")
-
-    if unfrozen_stage3:
-        print(f"Trainable parameters for Stage 3: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr_stage3,
-                                weight_decay=best_weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=patience // 2,
-                                                         verbose=False)
-        epochs_without_improvement = 0
-        for epoch in range(stage3_epochs):
-            epoch_num = total_epochs_run + 1
-            run_epoch(model, train_loader, criterion, optimizer, scaler, DEVICE, True, epoch_num, num_epochs)
-            avg_val_loss, val_accuracy = run_epoch(model, val_loader_split, criterion, None, scaler, DEVICE, False,
-                                                   epoch_num, num_epochs)
-            scheduler.step(avg_val_loss)
-            print(f'End of Epoch {epoch_num} - Current LR: {optimizer.param_groups[0]["lr"]:.6e}')
-            if avg_val_loss < overall_best_val_loss:
-                overall_best_val_loss = avg_val_loss;
-                epochs_without_improvement = 0
-                best_model_state_dict = model.state_dict();
-                torch.save(best_model_state_dict, model_save_path)
-                print(f'---> Overall Validation Loss Improved to {overall_best_val_loss:.4f}, model saved.')
-            else:
-                epochs_without_improvement += 1;
-                print(f'---> Stage 3 Val loss did not improve for {epochs_without_improvement} epochs.')
-                if epochs_without_improvement >= patience: print(
-                    f'Early stopping triggered during Stage 3 at epoch {epoch_num}.'); break
-            total_epochs_run = epoch_num
-    else:
-        print("Skipping Stage 3 training.")
 
     # --- Final Report ---
     if best_model_state_dict is not None:
         print(f'\nBest model saved to {model_save_path} with validation loss: {overall_best_val_loss:.4f}')
     else:
-        print("\nTraining completed, but no improvement observed over initial state (or validation failed).")
+        print("\nTraining completed, but no improvement observed.")
 
-    print("Script finished.")
+    print("Script finished. Evaluation/Submission should be done in a separate script.")
+

@@ -17,7 +17,7 @@ print(f"PyTorch Version: {torch.__version__}")
 print(f"Torchvision Version: {torchvision.__version__}") # Use transforms for version
 
 # --- Configuration ---
-model_save_path = 'convnext_staged_imgnorm.pth' # Path to the trained model
+model_save_path = 'convnext_2stage_imgnorm.pth' # Path to the trained model
 test_data_dir = './testset/testset'           # Directory with .npy test files
 output_csv_path = 'track_2.csv'               # Output CSV filename
 kaggle_competition = '8-860-1-00-coding-challenge-2025' # Your competition slug
