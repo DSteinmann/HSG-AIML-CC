@@ -4,11 +4,9 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torch.nn.functional as F
-# Use torch.amp directly for GradScaler and autocast
-# Note: GradScaler is typically used for training, not evaluation, but autocast is useful.
-from torch.cuda.amp import autocast, GradScaler # Keep GradScaler import for context if needed, but won't be used
+from torch.cuda.amp import autocast # Only need autocast for eval
 
-import rasterio
+import rasterio # Keep for potential future use
 import numpy as np
 import pandas as pd
 import os
@@ -16,450 +14,325 @@ import random
 import time
 import traceback
 from pathlib import Path
-# Use standard tqdm
 from tqdm import tqdm
 from typing import Tuple, List, Dict, Any, Optional, Callable
-
 import warnings
 
-# --- Suppress warnings (optional) ---
-# warnings.filterwarnings("ignore")
+# --- Device Setup ---
+USE_CUDA = torch.cuda.is_available()
+if USE_CUDA:
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available(): # Check for Apple Silicon GPU
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+print(f"Using device: {DEVICE}")
 
-# --- Configuration (Adjust as needed) ---
+# --- Suppress warnings ---
+warnings.filterwarnings("ignore")
+
+# --- Configuration ---
 EVAL_CONFIG = {
     "model": {
-        # !!! Point this to the actual saved weights of your trained Sentinel2Classifier !!!
-        "load_path": Path('./sentinel2_classifier_best.pth'), # Example path from training script
+        "name": "CustomSentinelCNN_IdxAfterNorm_v1", # Matches trained model name
+        "input_channels": 16, # 12 bands + 4 indices
+        # !!! Make sure this points to the weights saved by the corresponding training script !!!
+        "base_save_path": Path('./outputs/cnn_idx_after_norm_v1'), # Base path used in training
+        # --- Choose which weights to load ---
+        "load_weights_name": "cnn_idx_after_norm_v1_best.pth", # Load best model based on TIF validation
+        # "load_weights_name": "cnn_idx_after_norm_v1_epoch_40.pth", # Example: Load specific epoch checkpoint
+        # ----------------------------------
         # !!! IMPORTANT: Set these based on your training output !!!
         "num_classes": 10, # e.g., 10 (Must match the trained model)
         "class_names": ['AnnualCrop', 'Forest', 'HerbaceousVegetation', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake'], # e.g., ['class1', 'class2', ...] (Must match training)
+        # Dropout rates used in the trained model's head (copied from training config)
+        "dropout_head_1": 0.6,
+        "dropout_head_2": 0.4,
     },
     "data": {
-        "prediction_dir": Path('./testset/testset'), # Directory with .npy files
-        "num_workers": 4,
-        "image_size": 128, # Should match training image size
-        "batch_size": 32, # Can often be larger for evaluation
+        "prediction_dir": Path('./testset/testset'), # Directory with .npy files for prediction
+        "image_size": 128, # Should match image_size used during training
+        "batch_size": 64, # Can often be larger for evaluation (adjust based on VRAM)
+        "num_workers": 8, # Adjust based on CPU/system for evaluation
     },
-    "device": "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() and torch.backends.mps.is_built() else "cpu",
-    "amp_enabled": True, # Enable AMP if using CUDA and want potential speedup
+    "device": DEVICE.type,
+    "amp_enabled": USE_CUDA, # Enable AMP only on CUDA if desired for eval speed
     "prediction": {
-        "predictions_csv_path": Path('./outputs/predictions_sentinel2_classifier.csv'), # Updated output file name
+        "predictions_csv_path": Path('./outputs/predictions_cnn_idx_after_norm_v1.csv'), # Output file
         "kaggle_competition": 'aicrowd-geospatial-challenge', # Replace if needed
-        "kaggle_message": 'Submission with Sentinel2Classifier', # Updated message
+        "kaggle_message": 'Submission CustomSentinelCNN_IdxAfterNorm_v1',
         "submit_to_kaggle": False, # Set to False to skip submission attempt
     }
 }
+# Construct full load path
+EVAL_CONFIG["model"]["load_path"] = EVAL_CONFIG["model"]["base_save_path"] / EVAL_CONFIG["model"]["load_weights_name"]
+
 
 # --- Basic Setup ---
-DEVICE = torch.device(EVAL_CONFIG["device"])
-# AMP is enabled only if configured AND on CUDA device
 AMP_ENABLED = EVAL_CONFIG["amp_enabled"] and DEVICE.type == 'cuda'
-print(f"Using device: {DEVICE}")
 print(f"Automatic Mixed Precision (AMP) enabled for evaluation: {AMP_ENABLED}")
 
-# --- Make sure NUM_CLASSES and CLASS_NAMES are set ---
+# --- Validate Config ---
 if EVAL_CONFIG["model"]["num_classes"] is None or EVAL_CONFIG["model"]["class_names"] is None:
     raise ValueError("Please set 'num_classes' and 'class_names' in EVAL_CONFIG['model'] based on your training run.")
 NUM_CLASSES = EVAL_CONFIG["model"]["num_classes"]
 CLASS_NAMES = EVAL_CONFIG["model"]["class_names"]
-# Validate length consistency
 if len(CLASS_NAMES) != NUM_CLASSES:
      raise ValueError(f"Mismatch: num_classes ({NUM_CLASSES}) != length of class_names ({len(CLASS_NAMES)})")
 print(f"Expecting {NUM_CLASSES} classes: {CLASS_NAMES}")
 
 
-# --- Data Loading Function (Copied from training script) ---
+# --- Data Loading and Preprocessing ---
+# --- Band Selection: Use same indices as training script ---
+TARGET_BANDS_INDICES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12] # Excludes index 9 (10th band)
+# Map for index calculation (relative to the 12 selected bands)
+BAND_MAP = {
+    "B1_Coastal": 0, "B2_Blue": 1, "B3_Green": 2, "B4_Red": 3, "B5_RE1": 4, # Red Edge 1
+    "B6_RE2": 5, "B7_RE3": 6, "B8_NIR": 7, "B9_WV": 8, "B11_SWIR1": 9,
+    "B12_SWIR2": 10, "B8A_NIR2": 11
+}
+
 def load_sentinel2_image(filepath: str) -> Optional[np.ndarray]:
-    """Loads a Sentinel-2 image (TIF or NPY), returns NumPy CHW (12 bands) or None on error."""
+    """Loads NPY file, ensures 12 specific bands, returns (12, H, W) NumPy array or None."""
+    global TARGET_BANDS_INDICES
     try:
-        filepath_lower = filepath.lower()
-        if filepath_lower.endswith('.tif') or filepath_lower.endswith('.tiff'):
-            with rasterio.open(filepath) as src:
-                bands_to_read = [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13] # Assuming 1-based indexing in rasterio
-                if src.count < 13:
-                    print(f"Warning: Expected >=13 bands, got {src.count} in {filepath}. Reading available bands.")
-                    bands_to_read = list(range(1, min(src.count + 1, 13)))
-                    if len(bands_to_read) < 12:
-                         print(f"Error: Not enough bands ({len(bands_to_read)}) to form 12 channels in {filepath}. Skipping.")
-                         return None
-                image = src.read(bands_to_read)
+        filepath_lower = filepath.lower(); image_data = None
+        if not filepath_lower.endswith('.npy'): return None
+        image = np.load(filepath); processed_image = None
+        if image.ndim == 3 and image.shape[0] in [12, 13]: processed_image = image
+        elif image.ndim == 3 and image.shape[2] in [12, 13]: processed_image = image.transpose(2, 0, 1)
+        else: print(f"Error: Unexpected shape/dimensions for NPY {filepath}: {image.shape}. Skipping."); return None
+        if processed_image.shape[0] == 13: image_data = processed_image[TARGET_BANDS_INDICES, :, :]
+        elif processed_image.shape[0] == 12: image_data = processed_image
+        else: print(f"Error: Processed image has unexpected channel count ({processed_image.shape[0]}) for {filepath}. Skipping."); return None
+        if image_data is None or image_data.shape[0] != 12: return None
+        return image_data.astype(np.float32)
+    except Exception as e: print(f"Unexpected error loading NPY image {filepath}: {e}"); traceback.print_exc(); return None
 
-        elif filepath_lower.endswith('.npy'):
-            image = np.load(filepath)
-            if image.shape[0] != 12:
-                 if image.shape[0] == 13:
-                     # Assume standard Sentinel-2 order and drop B10 (index 9)
-                     indices_to_keep = list(range(9)) + [10, 11, 12]
-                     image = image[indices_to_keep, :, :]
-                 # Check if it's HWC and transpose
-                 elif image.ndim == 3 and image.shape[2] == 12:
-                     print(f"Info: Transposing NPY from (H, W, C) to (C, H, W) for {filepath}")
-                     image = np.transpose(image, (2, 0, 1))
-                 else:
-                    print(f"Error: Unexpected shape for .npy {filepath}: {image.shape}. Expected (12, H, W) or (13, H, W) or (H, W, 12). Skipping.")
-                    return None
-        else:
-            print(f"Error: Unsupported file type: {filepath}. Skipping.")
-            return None
-        return image.astype(np.float32)
-
-    except rasterio.RasterioIOError as e:
-        print(f"Rasterio Error loading {filepath}: {e}. Skipping.")
-        return None
-    except FileNotFoundError:
-        print(f"Error: File not found {filepath}. Skipping.")
-        return None
-    except Exception as e:
-        print(f"Unexpected error loading image {filepath}: {e}")
-        traceback.print_exc()
-        return None
-
-# --- Per-Image Normalization Function (Copied from training script) ---
+# --- Normalization for 12 channels (Matches training script) ---
 def normalize_image_per_image(image_np: np.ndarray) -> Optional[np.ndarray]:
     """Normalizes 12-channel NumPy image (C, H, W) using its own stats."""
-    if image_np is None: return None
-    if image_np.ndim != 3 or image_np.shape[0] != 12:
-        print(f"Error: Invalid shape for per-image normalization: {image_np.shape}. Expected (12, H, W). Skipping normalization.")
-        return None
-
-    mean = np.nanmean(image_np, axis=(1, 2), keepdims=True)
-    std = np.nanstd(image_np, axis=(1, 2), keepdims=True)
-    mean = np.nan_to_num(mean, nan=0.0)
-    std = np.nan_to_num(std, nan=1.0)
-    normalized_image = (image_np - mean) / (std + 1e-7)
-    normalized_image = np.clip(normalized_image, -5.0, 5.0) # Clipping
+    if image_np is None or image_np.ndim != 3 or image_np.shape[0] != 12: return None
+    mean = np.nanmean(image_np, axis=(1, 2), keepdims=True); std = np.nanstd(image_np, axis=(1, 2), keepdims=True)
+    mean = np.nan_to_num(mean, nan=0.0); std = np.nan_to_num(std, nan=1.0)
+    std_safe = std + 1e-7; normalized_image = (image_np - mean) / std_safe
+    normalized_image = np.clip(normalized_image, -6.0, 6.0)
+    if np.isnan(normalized_image).any() or np.isinf(normalized_image).any():
+        normalized_image = np.nan_to_num(normalized_image, nan=0.0, posinf=0.0, neginf=0.0)
     return normalized_image
 
-# --- Prediction Dataset Class (Copied from training script) ---
+# --- Index Calculation (operates on NORMALIZED 12 bands - Matches training script) ---
+def calculate_indices(image_np_12bands_normalized: np.ndarray, epsilon=1e-6) -> Dict[str, np.ndarray]:
+    """Calculates NDVI, NDWI, NDBI, NDRE1 from a NORMALIZED 12-band NumPy array. Clips output."""
+    indices = {}; clip_val = 10.0
+    try:
+        nir = image_np_12bands_normalized[BAND_MAP["B8_NIR"], :, :]; red = image_np_12bands_normalized[BAND_MAP["B4_Red"], :, :]
+        green = image_np_12bands_normalized[BAND_MAP["B3_Green"], :, :]; swir1 = image_np_12bands_normalized[BAND_MAP["B11_SWIR1"], :, :]
+        re1 = image_np_12bands_normalized[BAND_MAP["B5_RE1"], :, :]
+        # NDVI
+        denominator_ndvi = nir + red; ndvi = np.full_like(denominator_ndvi, 0.0, dtype=np.float32)
+        valid_mask_ndvi = np.abs(denominator_ndvi) > epsilon
+        ndvi[valid_mask_ndvi] = (nir[valid_mask_ndvi] - red[valid_mask_ndvi]) / denominator_ndvi[valid_mask_ndvi]
+        indices['NDVI'] = np.clip(np.nan_to_num(ndvi, nan=0.0, posinf=clip_val, neginf=-clip_val), -clip_val, clip_val)
+        # NDWI
+        denominator_ndwi = green + nir; ndwi = np.full_like(denominator_ndwi, 0.0, dtype=np.float32)
+        valid_mask_ndwi = np.abs(denominator_ndwi) > epsilon
+        ndwi[valid_mask_ndwi] = (green[valid_mask_ndwi] - nir[valid_mask_ndwi]) / denominator_ndwi[valid_mask_ndwi]
+        indices['NDWI'] = np.clip(np.nan_to_num(ndwi, nan=0.0, posinf=clip_val, neginf=-clip_val), -clip_val, clip_val)
+        # NDBI
+        denominator_ndbi = swir1 + nir; ndbi = np.full_like(denominator_ndbi, 0.0, dtype=np.float32)
+        valid_mask_ndbi = np.abs(denominator_ndbi) > epsilon
+        ndbi[valid_mask_ndbi] = (swir1[valid_mask_ndbi] - nir[valid_mask_ndbi]) / denominator_ndbi[valid_mask_ndbi]
+        indices['NDBI'] = np.clip(np.nan_to_num(ndbi, nan=0.0, posinf=clip_val, neginf=-clip_val), -clip_val, clip_val)
+        # NDRE1
+        denominator_ndre1 = nir + re1; ndre1 = np.full_like(denominator_ndre1, 0.0, dtype=np.float32)
+        valid_mask_ndre1 = np.abs(denominator_ndre1) > epsilon
+        ndre1[valid_mask_ndre1] = (nir[valid_mask_ndre1] - re1[valid_mask_ndre1]) / denominator_ndre1[valid_mask_ndre1]
+        indices['NDRE1'] = np.clip(np.nan_to_num(ndre1, nan=0.0, posinf=clip_val, neginf=-clip_val), -clip_val, clip_val)
+    except IndexError: print("Error: Band index out of bounds for index calculation."); return {}
+    except Exception as e: print(f"Error calculating indices: {e}"); traceback.print_exc(); return {}
+    return indices
+
+# --- Prediction Dataset Class (NPY Only, Indices AFTER Norm) ---
 class NpyPredictionDataset(Dataset):
-    """ Dataset for loading .npy files for prediction. """
+    """ Dataset: Loads NPY, normalizes 12 bands, calculates indices, stacks to 16ch. """
     def __init__(self, root_dir: str, transform: Optional[Callable] = None):
-        self.root_dir = Path(root_dir)
-        self.transform = transform
+        self.root_dir = Path(root_dir); self.transform = transform
+        self.output_channels = EVAL_CONFIG["model"]["input_channels"] # Should be 16
         self.file_paths = sorted([p for p in self.root_dir.glob('*.npy')])
-        if not self.file_paths:
-            raise FileNotFoundError(f"No .npy files found in {self.root_dir}")
-        print(f"Found {len(self.file_paths)} .npy files for prediction in {self.root_dir}.")
-
-    def __len__(self):
-        return len(self.file_paths)
-
-    # Return image tensor and path string
+        if not self.file_paths: raise FileNotFoundError(f"No .npy files found in {self.root_dir}")
+        print(f"Initialized NpyPredictionDataset (Indices After Norm) with {len(self.file_paths)} files. Output channels: {self.output_channels}")
+    def __len__(self): return len(self.file_paths)
     def __getitem__(self, idx: int) -> Optional[Tuple[torch.Tensor, str]]:
         image_path = str(self.file_paths[idx])
         try:
-            image_np = load_sentinel2_image(image_path)
-            if image_np is None: return None
-            image_np_normalized = normalize_image_per_image(image_np)
-            if image_np_normalized is None: return None
-            image_tensor = torch.from_numpy(image_np_normalized).float()
-            if self.transform:
-                image_tensor = self.transform(image_tensor)
+            # 1. Load NPY (12 raw-ish bands)
+            image_np_12 = load_sentinel2_image(image_path)
+            if image_np_12 is None: return None
+            # 2. Normalize the 12 bands
+            image_np_norm_12 = normalize_image_per_image(image_np_12)
+            if image_np_norm_12 is None: return None
+            # 3. Calculate Indices from NORMALIZED bands
+            indices_dict = calculate_indices(image_np_norm_12)
+            if not indices_dict: return None
+            # 4. Stack normalized bands and indices
+            indices_list = [indices_dict['NDVI'], indices_dict['NDWI'], indices_dict['NDBI'], indices_dict['NDRE1']]
+            indices_arrays = [idx[np.newaxis, :, :] for idx in indices_list]
+            final_image_np = np.concatenate([image_np_norm_12] + indices_arrays, axis=0) # (16, H, W)
+            if final_image_np.shape[0] != self.output_channels: return None
+            # 5. Convert to tensor
+            image_tensor = torch.from_numpy(final_image_np).float()
+            # 6. Apply transforms (resize)
+            if self.transform: image_tensor = self.transform(image_tensor)
             return image_tensor, image_path
-        except Exception as e:
-            print(f"Error processing prediction image {image_path}:")
-            traceback.print_exc()
-            return None # Signal error
+        except Exception as e: print(f"Error processing prediction image {image_path}:"); traceback.print_exc(); return None
 
-# --- Custom Collate Function (Copied from training script) ---
+# --- Custom Collate Function ---
 def collate_fn(batch):
-    """ Filters out None samples and stacks the rest. """
+    """ Filters out None samples and stacks the rest using default_collate. """
     batch = [item for item in batch if item is not None]
-    if not batch:
-        return None # Return None if the whole batch was invalid
-    try:
-        # Use default_collate for valid items
-        return torch.utils.data.dataloader.default_collate(batch)
-    except Exception as e:
-        print(f"Error in collate_fn during stacking: {e}. Skipping batch.")
-        return None
+    if not batch: return None
+    try: return torch.utils.data.dataloader.default_collate(batch)
+    except Exception as e: print(f"Error in collate_fn: {e}. Skipping batch."); return None
 
-# --- Transforms (Copied - only need evaluation transforms) ---
-img_size = EVAL_CONFIG["data"]["image_size"]
+# --- Transforms (Evaluation only needs resizing) ---
+IMG_SIZE = EVAL_CONFIG["data"]["image_size"]
 eval_transforms = transforms.Compose([
-    transforms.Resize((img_size, img_size), antialias=True),
-    # Normalization is done per-image in the Dataset __getitem__
+    transforms.Resize((IMG_SIZE, IMG_SIZE), antialias=True),
 ])
 
-# --- Model Architecture Definition ---
-# Mish Activation Function (Compatible with training script)
+# --- Custom Model Definition (ResNet-like Blocks - Copied from training script) ---
 class Mish(nn.Module):
-    """Applies the Mish activation function element-wise."""
-    def forward(self, x):
-        return x * torch.tanh(F.softplus(x))
-
-# Squeeze-and-Excitation Block (Compatible with training script)
+    def forward(self, x): return x * torch.tanh(F.softplus(x))
 class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for channel attention."""
     def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
-            Mish(),
-            nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
-            nn.Sigmoid()
-        )
+        super().__init__(); self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False), Mish(), nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False), nn.Sigmoid())
+    def forward(self, x): return x * self.excitation(self.squeeze(x))
+class ResidualConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, use_se=True):
+        super().__init__(); self.stride = stride
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels); self.activation = Mish()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels); self.se = SEBlock(out_channels) if use_se else nn.Identity()
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False), nn.BatchNorm2d(out_channels))
     def forward(self, x):
-        squeezed = self.squeeze(x)
-        excited = self.excitation(squeezed)
-        return x * excited
-
-# --- Sentinel2Classifier Model (Copied from the training script) ---
-class Sentinel2Classifier(nn.Module):
-    """ Custom CNN for Sentinel-2 image classification with Residual Connections,
-        SE Attention, Hybrid Pooling & Mish Activation. """
-    def __init__(self, num_classes: int, input_channels: int = 12):
+        residual = self.shortcut(x); out = self.conv1(x); out = self.bn1(out); out = self.activation(out)
+        out = self.conv2(out); out = self.bn2(out); out = self.se(out); out += residual; out = self.activation(out)
+        return out
+class CustomSentinelCNN_v2(nn.Module): # Name matches training script
+    """Custom CNN with ResNet-like blocks (must match training script)."""
+    def __init__(self, num_classes: int, input_channels: int = EVAL_CONFIG["model"]["input_channels"]): # Use config input channels
         super().__init__()
-        if num_classes <= 0:
-            raise ValueError("num_classes must be positive.")
-
-        self.mish = Mish()
-
-        # --- Convolutional Blocks ---
-        def conv_block(in_c, out_c, kernel_size=3, stride=1, padding=1):
-            return nn.Sequential(
-                nn.Conv2d(in_c, out_c, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
-                nn.BatchNorm2d(out_c),
-                Mish()
-            )
-
-        self.conv1 = conv_block(input_channels, 64)
-        self.res_conv1 = nn.Conv2d(input_channels, 64, kernel_size=1, bias=False)
-        self.se1 = SEBlock(64)
-
-        self.conv2 = conv_block(64, 128)
-        self.res_conv2 = nn.Conv2d(64, 128, kernel_size=1, bias=False)
-        self.se2 = SEBlock(128)
-
-        self.conv3 = conv_block(128, 256)
-        self.res_conv3 = nn.Conv2d(128, 256, kernel_size=1, bias=False)
-        self.se3 = SEBlock(256)
-
-        self.conv4 = conv_block(256, 512)
-        self.res_conv4 = nn.Conv2d(256, 512, kernel_size=1, bias=False)
-        self.se4 = SEBlock(512)
-
-        # --- Pooling ---
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        pooled_features = 512
-
-        # --- Fully Connected Layers ---
-        self.fc1 = nn.Linear(pooled_features, 256)
-        self.bn_fc1 = nn.BatchNorm1d(256)
-        self.dropout1 = nn.Dropout(0.5)
-
-        self.fc2 = nn.Linear(256, 128)
-        self.bn_fc2 = nn.BatchNorm1d(128)
-        self.dropout2 = nn.Dropout(0.4)
-
-        self.fc_out = nn.Linear(128, num_classes)
-
-        # No need to initialize weights here, we are loading them
-        # self.apply(self._initialize_weights)
-        print(f"Instantiated {self.__class__.__name__} for evaluation.")
-
-    # _initialize_weights method is not needed for evaluation script
-
+        print(f"Creating CustomSentinelCNN_v2 for evaluation: {input_channels} channels, {num_classes} classes.")
+        if input_channels <= 0: raise ValueError("input_channels must be positive.")
+        self.stem = nn.Sequential( nn.Conv2d(input_channels, 64, kernel_size=3, stride=1, padding=1, bias=False), nn.BatchNorm2d(64), Mish(), nn.MaxPool2d(kernel_size=2, stride=2) )
+        self.layer1 = self._make_layer(64, 64, num_blocks=2, stride=1)
+        self.layer2 = self._make_layer(64, 128, num_blocks=2, stride=2)
+        self.layer3 = self._make_layer(128, 256, num_blocks=2, stride=2)
+        self.layer4 = self._make_layer(256, 512, num_blocks=2, stride=2)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1); self.max_pool = nn.AdaptiveMaxPool2d(1); pooled_features = 512
+        # Use dropout rates defined in config (matching training)
+        dropout1 = EVAL_CONFIG["model"].get("dropout_head_1", 0.6)
+        dropout2 = EVAL_CONFIG["model"].get("dropout_head_2", 0.4)
+        self.head = nn.Sequential( nn.Flatten(), nn.BatchNorm1d(pooled_features * 2), nn.Dropout(dropout1),
+            nn.Linear(pooled_features * 2, 256), Mish(), nn.BatchNorm1d(256), nn.Dropout(dropout2),
+            nn.Linear(256, num_classes) )
+        # No weight initialization needed
+    def _make_layer(self, in_channels, out_channels, num_blocks, stride):
+        layers = []; layers.append(ResidualConvBlock(in_channels, out_channels, stride=stride))
+        for _ in range(1, num_blocks): layers.append(ResidualConvBlock(out_channels, out_channels, stride=1))
+        return nn.Sequential(*layers)
     def forward(self, x):
-        res1 = self.res_conv1(x)
-        x = self.conv1(x)
-        x = self.se1(x) + res1
-
-        res2 = self.res_conv2(x)
-        x = self.conv2(x)
-        x = self.se2(x) + res2
-
-        res3 = self.res_conv3(x)
-        x = self.conv3(x)
-        x = self.se3(x) + res3
-
-        res4 = self.res_conv4(x)
-        x = self.conv4(x)
-        x = self.se4(x) + res4
-
-        avg_p = self.avg_pool(x)
-        max_p = self.max_pool(x)
-        x = avg_p + max_p # Combine pooling outputs
-        x = torch.flatten(x, 1)
-
-        x = self.fc1(x)
-        x = self.bn_fc1(x)
-        x = self.mish(x)
-        x = self.dropout1(x)
-
-        x = self.fc2(x)
-        x = self.bn_fc2(x)
-        x = self.mish(x)
-        x = self.dropout2(x)
-
-        x = self.fc_out(x)
+        x = self.stem(x); x = self.layer1(x); x = self.layer2(x); x = self.layer3(x); x = self.layer4(x)
+        avg_p = self.avg_pool(x); max_p = self.max_pool(x); x = torch.cat((avg_p, max_p), dim=1); x = self.head(x)
         return x
 
 # --- Main Evaluation Function ---
 def evaluate_model(config: Dict[str, Any], device: torch.device, num_classes: int, class_names: List[str]):
-    """Loads model, runs prediction, saves CSV, and optionally submits."""
-
+    """Loads model, runs prediction on NPY files (indices AFTER norm), saves CSV."""
     # --- Data ---
     try:
         pred_dataset = NpyPredictionDataset(config["data"]["prediction_dir"], transform=eval_transforms)
-        pred_loader = DataLoader(
-            pred_dataset,
-            batch_size=config["data"]["batch_size"],
-            shuffle=False,
-            num_workers=config["data"]["num_workers"],
-            pin_memory=True, # Use pin_memory if using GPU
-            collate_fn=collate_fn # Use the safe collate function
-        )
-    except FileNotFoundError as e:
-        print(f"Error creating prediction dataset: {e}")
-        return
-    except Exception as e:
-        print(f"An unexpected error occurred during data loading setup: {e}")
-        traceback.print_exc()
-        return
+        pred_loader = DataLoader( pred_dataset, batch_size=config["data"]["batch_size"], shuffle=False,
+            num_workers=config["data"]["num_workers"], pin_memory=True, collate_fn=collate_fn )
+    except Exception as e: print(f"Error creating prediction dataset/loader: {e}"); traceback.print_exc(); return
 
     # --- Model ---
-    # !!! Instantiate the CORRECT model class !!!
-    model = Sentinel2Classifier(num_classes=num_classes)
-    model_path = config["model"]["load_path"]
-
-    if not model_path.exists():
-        print(f"ERROR: Model weights file not found at {model_path}")
-        return
-
+    model = CustomSentinelCNN_v2(num_classes=num_classes, input_channels=config["model"]["input_channels"]) # Should be 16 channels
+    model_path = config["model"]["load_path"] # Constructed path
+    if not model_path.exists(): print(f"ERROR: Model weights file not found at {model_path}"); return
     try:
         print(f"Loading model weights from: {model_path}")
-        # Load state dict - ensure map_location is set for cross-device compatibility
         model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval() # Set model to evaluation mode
+        model.to(device); model.eval()
         print("Model loaded successfully.")
-    except Exception as e:
-        print(f"Error loading model state_dict: {e}")
-        traceback.print_exc()
-        return
+    except Exception as e: print(f"Error loading model state_dict: {e}"); traceback.print_exc(); return
 
     # --- Prediction ---
-    predictions = []
-    image_ids = [] # Store image IDs (e.g., filenames)
-
+    predictions = []; image_ids = []
     print("\n--- Starting Prediction ---")
-    with torch.no_grad(): # Disable gradient calculations for evaluation
+    with torch.no_grad():
         progress_bar = tqdm(pred_loader, desc="Predicting")
         for batch_data in progress_bar:
-            if batch_data is None:
-                print("Warning: Skipping None batch (likely due to loading error).")
-                continue # Skip failed batches
-
+            if batch_data is None: print("Warning: Skipping None batch."); continue
             try:
-                inputs, paths = batch_data # Unpack image tensors and paths
-                inputs = inputs.to(device, non_blocking=True) # Use non_blocking with pin_memory
-
-                # Use autocast context manager for AMP if enabled
+                inputs, paths = batch_data # Unpack image tensors (16 channels) and paths
+                inputs = inputs.to(device, non_blocking=True)
                 with autocast(dtype=torch.float16, enabled=AMP_ENABLED):
                     outputs = model(inputs)
-
-                # Get predicted class indices (highest logit score)
                 _, predicted_indices = torch.max(outputs, 1)
                 predictions.extend(predicted_indices.cpu().numpy())
-
-                # Extract image IDs (e.g., filename without extension)
-                batch_ids = [Path(p).stem for p in paths] # Get 'test_0000' etc.
+                batch_ids = [Path(p).stem for p in paths] # Get stem like 'test_0001'
                 image_ids.extend(batch_ids)
+            except Exception as e: print(f"\nError during prediction batch: {e}"); traceback.print_exc()
 
-            except Exception as e:
-                print(f"\nError during prediction batch: {e}")
-                traceback.print_exc()
-                # Decide whether to stop or continue
-                # continue
-
-    if not predictions:
-        print("\nError: No predictions were generated. Check dataset and prediction loop.")
-        return
-    if not image_ids:
-        print("\nError: No image IDs were collected. Check dataset and prediction loop.")
-        return
+    if not predictions or not image_ids: print("\nError: No predictions or image IDs generated."); return
 
     # --- Generate Submission File ---
     print(f"\nGenerated {len(predictions)} predictions for {len(image_ids)} images.")
     if len(predictions) != len(image_ids):
-         # Handle potential mismatch if some images failed loading in batches
-         print(f"Warning: Mismatch between predictions ({len(predictions)}) and image IDs ({len(image_ids)}). Check for errors during data loading/prediction.")
-         # Attempt to proceed with the minimum count, but investigate the cause
-         min_len = min(len(predictions), len(image_ids))
-         predictions = predictions[:min_len]
-         image_ids = image_ids[:min_len]
-         print(f"Proceeding with {min_len} pairs.")
-
-
+         print(f"Warning: Mismatch predictions vs image IDs ({len(predictions)} vs {len(image_ids)})."); min_len = min(len(predictions), len(image_ids))
+         predictions = predictions[:min_len]; image_ids = image_ids[:min_len]; print(f"Proceeding with {min_len} pairs.")
     try:
-        # Map predicted indices to class names
         predicted_class_names = [class_names[idx] for idx in predictions]
-
-        pred_df = pd.DataFrame({
-            'test_id': image_ids,
-            'label': predicted_class_names
-        })
-
-        # Optional: Clean test_id if needed (e.g., remove 'test_')
-        # pred_df['test_id'] = pred_df['test_id'].str.replace('test_', '', regex=False)
-
+        pred_df = pd.DataFrame({'test_id': image_ids, 'label': predicted_class_names})
+        # Remove "test_" prefix
+        pred_df['test_id'] = pred_df['test_id'].str.replace('test_', '', regex=False)
+        print("Removed 'test_' prefix from test_id column.")
         csv_path = config["prediction"]["predictions_csv_path"]
-        # Ensure output directory exists
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         pred_df.to_csv(csv_path, index=False)
         print(f"Predictions saved to: {csv_path}")
-
-    except IndexError as e:
-         print(f"\nError mapping prediction indices to class names: {e}")
-         print(f"Predicted index {e} is out of bounds for class_names list (length {len(class_names)}).")
-         print("Ensure NUM_CLASSES and CLASS_NAMES in EVAL_CONFIG match the trained model exactly.")
-         return
-    except Exception as e:
-         print(f"\nError creating or saving submission CSV: {e}")
-         traceback.print_exc()
-         return
-
+    except IndexError as e: print(f"\nError mapping prediction index: {e}. Check num_classes/class_names."); return
+    except Exception as e: print(f"\nError creating/saving CSV: {e}"); traceback.print_exc(); return
 
     # --- Kaggle Submission (Optional) ---
     if config["prediction"]["submit_to_kaggle"]:
         print("\n--- Attempting Kaggle Submission ---")
+        # (Kaggle submission logic remains the same)
         try:
-            # Ensure kaggle package is installed: pip install kaggle
             from kaggle.api.kaggle_api_extended import KaggleApi
-            api = KaggleApi()
-            api.authenticate() # Requires kaggle.json to be set up
-
+            api = KaggleApi(); api.authenticate()
             competition = config["prediction"]["kaggle_competition"]
             message = config["prediction"]["kaggle_message"]
-
-            if not competition:
-                 print("Kaggle competition slug is not set in EVAL_CONFIG. Skipping submission.")
-                 return
-
+            if not competition: print("Kaggle competition slug not set. Skipping."); return
             print(f"Submitting {csv_path} to competition: {competition}")
-            api.competition_submit(
-                 file_name=str(csv_path),
-                 message=message,
-                 competition=competition
-            )
+            api.competition_submit(file_name=str(csv_path), message=message, competition=competition)
             print("Submission successful!")
-        except ImportError:
-            print("Kaggle API not found. Skipping submission. Install with: pip install kaggle")
-        except Exception as e:
-            print(f"Kaggle API submission failed: {e}")
-            print("Check kaggle.json configuration, competition slug, and API key validity.")
+        except ImportError: print("Kaggle API not found. Install with: pip install kaggle")
+        except Exception as e: print(f"Kaggle API submission failed: {e}")
 
 # --- Run Evaluation ---
 if __name__ == '__main__':
-    # Ensure output directory exists before starting
     try:
         EVAL_CONFIG["prediction"]["predictions_csv_path"].parent.mkdir(parents=True, exist_ok=True)
         evaluate_model(EVAL_CONFIG, DEVICE, NUM_CLASSES, CLASS_NAMES)
     except Exception as main_e:
         print(f"\nA critical error occurred during script execution: {main_e}")
         traceback.print_exc()
-
     print("\nEvaluation script finished.")
+
