@@ -1,0 +1,43 @@
+# Configuration for ResNet50 Fine-tuning with SWA
+model:
+  name: "ResNet50_16ch_EuroSAT_Finetune_SWA_v1"
+  pretrained: True # Important: For fine-tuning
+  input_channels: 16
+  base_save_path: './outputs/resnet50_16ch_eurosat_finetune_swa_v1' # Separate path
+  # num_classes and class_names determined from data in script
+
+data:
+  train_dir: './ds/images/remote_sensing/otherDatasets/sentinel_2/tif' # Use Path() in script
+  image_size: 224
+  batch_size: 32 # Adjust based on GPU memory for fine-tuning
+  num_workers: 8
+  train_ratio: 0.9
+
+train:
+  seed: 42 # Use a different seed for comparison?
+  epochs: 30     
+  lr: 1e-4         
+  warmup_epochs: 2    
+  optimizer: "AdamW"
+  weight_decay: 1e-4  
+  scheduler: "CosineAnnealingLR"
+  T_max_epochs: 30    
+  eta_min: 1e-6
+  patience: 10        
+  label_smoothing: 0.1
+  gradient_accumulation_steps: 2
+  gradient_clip_norm: 1.0
+  use_mixup: True
+  mixup_alpha: 0.2 
+  use_cutmix: False
+  cutmix_alpha: 1.0
+  mixup_prob: 1.0
+  checkpoint_interval: 5
+  # SWA Parameters
+  swa_start_epoch: 20 
+  swa_lr: 5e-6      #
+  swa_anneal_epochs: 3
+
+device: "cuda" # Or "mps", "cpu" - Script will override if auto-detecting
+amp_enabled: True # Script overrides based on CUDA availability
+

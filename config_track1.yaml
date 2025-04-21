@@ -1,0 +1,43 @@
+# Configuration for ResNet50 Training from Scratch with SWA
+model:
+  name: "ResNet50_16ch_EuroSAT_Scratch_SWA_v1"
+  pretrained: False # Important: For scratch training
+  input_channels: 16
+  base_save_path: './outputs/resnet50_16ch_eurosat_scratch_swa_v1' # Use Path() in script
+  # num_classes and class_names determined from data in script
+
+data:
+  train_dir: './ds/images/remote_sensing/otherDatasets/sentinel_2/tif' # Use Path() in script
+  image_size: 224
+  batch_size: 32
+  num_workers: 8
+  train_ratio: 0.9
+
+train:
+  seed: 1337
+  epochs: 150      
+  lr: 5e-4          
+  warmup_epochs: 5
+  optimizer: "AdamW"
+  weight_decay: 1e-3 
+  scheduler: "CosineAnnealingLR"
+  T_max_epochs: 150   # Match epochs (adjusted in script for SWA)
+  eta_min: 1e-6
+  patience: 20       
+  label_smoothing: 0.1
+  gradient_accumulation_steps: 2
+  gradient_clip_norm: 1.0
+  use_mixup: True
+  mixup_alpha: 0.4
+  use_cutmix: False
+  cutmix_alpha: 1.0
+  mixup_prob: 1.0
+  checkpoint_interval: 15 
+  # SWA Parameters
+  swa_start_epoch: 70 # Adjust based on total epochs
+  swa_lr: 1e-5
+  swa_anneal_epochs: 5
+
+device: "cuda" # Or "mps", "cpu" - Script will override if auto-detecting
+amp_enabled: True # Script overrides based on CUDA availability
+

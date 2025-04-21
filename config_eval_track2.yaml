@@ -1,0 +1,34 @@
+# Example Evaluation Configuration for SWA Model
+model:
+  # Should match the name used during SWA training for clarity
+  name: "ResNet50_16ch_EuroSAT_Finetune_SWA_v1"
+  # Pretrained flag should match how the architecture was defined,
+  # but weights are loaded explicitly below. False for scratch.
+  pretrained: True
+  input_channels: 16
+  # --- IMPORTANT: Point to SWA training output ---
+  base_save_path: './outputs/resnet50_16ch_eurosat_finetune_swa_v1' # Use Path() in script
+  # --- IMPORTANT: Specify SWA checkpoint file ---
+  load_weights_name: "ResNet50_16ch_EuroSAT_Finetune_SWA_v1_best_non_swa.pth"
+  # --- IMPORTANT: Class details needed for evaluation ---
+  num_classes: 10
+  class_names: ['AnnualCrop', 'Forest', 'HerbaceousVegetation', 'Highway', 'Industrial', 'Pasture', 'PermanentCrop', 'Residential', 'River', 'SeaLake']
+
+data:
+  prediction_dir: './testset/testset' # Use Path() in script
+  image_size: 224
+  batch_size: 64 # Evaluation batch size
+  num_workers: 8
+
+# Device and AMP settings will be auto-detected/overridden by script
+device: "cuda"
+amp_enabled": True
+
+prediction:
+  # Output CSV path for this evaluation run
+  predictions_csv_path: './outputs/predictions_resnet50_16ch_scratch_swa_v1.csv' # Use Path() in script
+  kaggle_competition: 'aicrowd-geospatial-challenge' # Optional: Kaggle competition slug
+  kaggle_message: 'Submission ResNet50_16ch_Scratch_SWA_v1' # Optional: Kaggle submission message
+  submit_to_kaggle: False # Optional: Set to True to attempt submission
+  use_tta: True # Optional: Enable/disable Test Time Augmentation (Orig+HFlip)
+
