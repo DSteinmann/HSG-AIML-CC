@@ -2,3 +2,7 @@
 /outputs/
 /ds/
 /.ipynb_checkpoints/
+.vscode/
+.idea/
+*.zip
+__pycache__/
