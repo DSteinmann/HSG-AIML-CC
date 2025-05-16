@@ -1,6 +1,6 @@
 # HSG-AIML-CC
 
-```markdown
+
 ## Project Overview
 
 This repository provides code and resources for classifying **land use and land cover** from **Sentinel-2 satellite images** using the deep learning approaches we have learned in class. Leveraging the **EuroSAT dataset** (from the Copernicus program), we implement and experiment with **Convolutional Neural Networks (CNNs)** to recognize 10 land cover classes with pre-trained and non-pretrained weights. The core aim is to analyze the impact of different spectral band combinations and model architectures on classification accuracy in an explorative manner.
@@ -74,7 +74,7 @@ python eval.py --config config_eval_track1.yaml
 
 ---
 
-## 🗂 Notebooks
+## Notebooks
 
 - **cc_01_getting_started.ipynb**: Interactive introduction, setup, basic data exploration, and experiment guide.
 
