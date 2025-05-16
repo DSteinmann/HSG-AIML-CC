@@ -109,6 +109,6 @@ python eval.py --config config_eval_track1.yaml
 
 | Aid                          | Description      | Areas Affected |
 |-------------------------------|-----------|-------------|
-| `Google's Gemini AI`                  | X     | X |
-| `ChatGPT4o`                   | X      | X |
-| `Github Copilot` | X  | X |
+| `Google's Gemini AI`          | Help with writing/debugging the code as well as getting explanations for the different theoretical concepts        | Entire project/repository |
+| `ChatGPT4o`                   | Help with writing/debugging the code as well as getting explanations for the different theoretical concepts        | Entire project/repository |
+| `Github Copilot` | Help with writing the project overview  | README.md |
