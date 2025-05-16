@@ -99,9 +99,16 @@ python eval.py --config config_eval_track1.yaml
 
 ---
 
-## 📚 References
+## References
 
 - [EuroSAT: A Novel Dataset and Deep Learning Benchmark for Land Use and Land Cover Classification](https://arxiv.org/abs/1709.00029)
 - [EuroSAT GitHub](https://github.com/phelber/eurosat)
 
 ---
+## Directory of Aids 
+
+| Aid                          | Description      | Areas Affected |
+|-------------------------------|-----------|-------------|
+| `Google's Gemini AI`                  | X     | X |
+| `ChatGPT4o`                   | X      | X |
+| `Github Copilot` | X  | X |
