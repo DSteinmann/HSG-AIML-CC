@@ -3,7 +3,7 @@
 
 ## Project Overview
 
-This repository provides code and resources for classifying **land use and land cover** from **Sentinel-2 satellite images** using the deep learning approaches we have learned in class. Leveraging the **EuroSAT dataset** (from the Copernicus program), we implement and experiment with **Convolutional Neural Networks (CNNs)** to recognize 10 land cover classes with pre-trained and non-pretrained weights. The core aim is to analyze the impact of different spectral band combinations and model architectures on classification accuracy in an explorative manner.
+This repository provides code and resources for classifying **land use and land cover** from **Sentinel-2 satellite images** using the deep learning approaches we have learned in class. Leveraging the **EuroSAT dataset** (from the Copernicus program), we implement and experiment with **Convolutional Neural Networks (CNNs)** to recognize 10 land cover classes with pre-trained and non-pretrained weights. The core aim is to analyze the impact of different spectral band combinations and model architectures on classification accuracy in an explorative manner. We used 16 channels in total for image-classification.
 ---
 ## Dataset
 
