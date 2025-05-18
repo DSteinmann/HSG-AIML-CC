@@ -238,6 +238,7 @@ dependencies:
   - safetensors=0.5.3=py312h12e396e_0
   - scikit-learn=1.6.1=py312h6a678d5_0
   - scipy=1.15.2=py312ha707e6e_0
+  - seaborn=0.13.2=py312h06a4308_2
   - segmentation-models-pytorch=0.4.0=pyh101cb37_0
   - setuptools=75.8.2=pyhff2d567_0
   - shapely=2.0.7=py312h21f5128_1
