@@ -105,8 +105,9 @@ python eval.py --config config_eval_track1.yaml
 
 ---
 ## Results Track 2 Pretrained Weights
-![Bild (1)](https://github.com/user-attachments/assets/f5626d66-d5d7-481b-a771-d00853475362)
 ![Bild](https://github.com/user-attachments/assets/41fb4590-d4dc-43f8-a5a8-7a760f80a3fc)
+![Bild (1)](https://github.com/user-attachments/assets/f5626d66-d5d7-481b-a771-d00853475362)
+
 
 
 ## References
