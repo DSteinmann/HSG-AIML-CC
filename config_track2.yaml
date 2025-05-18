@@ -14,7 +14,7 @@ data:
   train_ratio: 0.9
 
 train:
-  seed: 42 # Use a different seed for comparison?
+  seed: 1337 # Use a different seed for comparison?
   epochs: 30     
   lr: 1e-4         
   warmup_epochs: 2    

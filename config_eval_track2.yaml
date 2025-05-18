@@ -26,9 +26,9 @@ amp_enabled": True
 
 prediction:
   # Output CSV path for this evaluation run
-  predictions_csv_path: './outputs/predictions_resnet50_16ch_scratch_swa_v1.csv' # Use Path() in script
-  kaggle_competition: 'aicrowd-geospatial-challenge' # Optional: Kaggle competition slug
-  kaggle_message: 'Submission ResNet50_16ch_Scratch_SWA_v1' # Optional: Kaggle submission message
+  predictions_csv_path: './outputs/predictions_resnet50_16ch_fine_tune_swa_v1.csv' # Use Path() in script
+  kaggle_competition: '8-860-1-00-coding-challenge-2025' # Optional: Kaggle competition slug
+  kaggle_message: 'Track2' # Optional: Kaggle submission message
   submit_to_kaggle: False # Optional: Set to True to attempt submission
   use_tta: True # Optional: Enable/disable Test Time Augmentation (Orig+HFlip)
 
