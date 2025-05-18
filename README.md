@@ -99,6 +99,16 @@ python eval.py --config config_eval_track1.yaml
 
 ---
 
+## Results Track 1 (No pretrained Weights)
+![Bild (3)](https://github.com/user-attachments/assets/986b2d7e-1526-4f61-9c5d-0ccee114cf2a)
+![Bild (2)](https://github.com/user-attachments/assets/92fc1a94-91f6-41d7-8e58-da617ffff507)
+
+---
+## Results Track 2 Pretrained Weights
+![Bild (1)](https://github.com/user-attachments/assets/f5626d66-d5d7-481b-a771-d00853475362)
+![Bild](https://github.com/user-attachments/assets/41fb4590-d4dc-43f8-a5a8-7a760f80a3fc)
+
+
 ## References
 
 - [EuroSAT: A Novel Dataset and Deep Learning Benchmark for Land Use and Land Cover Classification](https://arxiv.org/abs/1709.00029)
